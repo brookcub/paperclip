@@ -15,7 +15,7 @@ import type {
  * card cannot drift into three different names for the same thing.
  */
 
-export type ConnectionTypeLabel = "Personal" | "Dedicated agent" | "Company";
+export type ConnectionTypeLabel = "Personal" | "Dedicated agent" | "Organization";
 
 /** The two connection types shown throughout the product. */
 export function connectionTypeLabel(
@@ -25,18 +25,18 @@ export function connectionTypeLabel(
     ? "Personal"
     : credentialPolicy === "per_agent"
       ? "Dedicated agent"
-      : "Company";
+      : "Organization";
 }
 
-const COMPANY_NAME_SUFFIX = " for the company";
+const ORGANIZATION_NAME_SUFFIX = " for the organization";
 
 /** Keep company-owned connections unmistakable anywhere their name appears. */
 export function connectionNameForGrantKind(name: string, grantKind: ConnectionGrantKind): string {
   const trimmed = name.trim();
-  if (grantKind !== "organization" || trimmed.toLocaleLowerCase().endsWith(COMPANY_NAME_SUFFIX)) {
+  if (grantKind !== "organization" || trimmed.toLocaleLowerCase().endsWith(ORGANIZATION_NAME_SUFFIX)) {
     return trimmed;
   }
-  return `${trimmed}${COMPANY_NAME_SUFFIX}`;
+  return `${trimmed}${ORGANIZATION_NAME_SUFFIX}`;
 }
 
 export function connectionNameForCredentialPolicy(
@@ -45,7 +45,7 @@ export function connectionNameForCredentialPolicy(
 ): string {
   return connectionNameForGrantKind(
     name,
-    connectionTypeLabel(credentialPolicy) === "Company" ? "organization" : "user",
+    connectionTypeLabel(credentialPolicy) === "Organization" ? "organization" : "user",
   );
 }
 
