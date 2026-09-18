@@ -26,6 +26,14 @@ Server-side Git operations and GitHub gateway calls follow the same selection ru
 
 Managed commands disable ambient Git credential helpers, Git global/system configuration, host GitHub CLI configuration, and host SSH identity access. Per-operation GitHub CLI configuration is isolated in a writable configuration directory beneath the managed launcher directory. Missing credentials clear previous author and token values; no teammate, standing delegation, host token, or company-default user's account is substituted. Anonymous/local operations remain available where supported.
 
+Without a managed identity, local commits can use an explicitly configured
+repository identity or `git -c user.name=... -c user.email=...`. The launcher
+leaves author/committer environment variables unset and requires configured
+identity instead of guessing the host user's details. Managed shell profiles
+remove empty identity overrides after environment merging, so agents do not
+need to unset them per command. A captured managed identity still takes
+precedence over repository configuration.
+
 Remote launchers prepend their directory to the execution target's effective
 `PATH`. An explicit remote `PATH` override is preserved; otherwise Paperclip
 reads the provider's environment before staging the launcher shell files.
