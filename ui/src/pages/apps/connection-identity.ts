@@ -30,11 +30,27 @@ export function connectionTypeLabel(
 
 const ORGANIZATION_NAME_SUFFIX = " for the organization";
 
-/** Keep company-owned connections unmistakable anywhere their name appears. */
+/**
+ * Connections created before the rename persisted the old suffix. Treat it as
+ * the same suffix so a legacy row reads "Slack for the organization" and never
+ * "Slack for the company for the organization" — the setup flow persists this
+ * name when a draft resumes, so a doubled suffix would outlive the render.
+ */
+const LEGACY_ORGANIZATION_NAME_SUFFIX = " for the company";
+
+/** Keep organization-owned connections unmistakable anywhere their name appears. */
 export function connectionNameForGrantKind(name: string, grantKind: ConnectionGrantKind): string {
   const trimmed = name.trim();
-  if (grantKind !== "organization" || trimmed.toLocaleLowerCase().endsWith(ORGANIZATION_NAME_SUFFIX)) {
+  if (grantKind !== "organization") {
     return trimmed;
+  }
+  const lowercased = trimmed.toLocaleLowerCase();
+  if (lowercased.endsWith(ORGANIZATION_NAME_SUFFIX)) {
+    return trimmed;
+  }
+  if (lowercased.endsWith(LEGACY_ORGANIZATION_NAME_SUFFIX)) {
+    const base = trimmed.slice(0, trimmed.length - LEGACY_ORGANIZATION_NAME_SUFFIX.length).trimEnd();
+    return `${base}${ORGANIZATION_NAME_SUFFIX}`;
   }
   return `${trimmed}${ORGANIZATION_NAME_SUFFIX}`;
 }
