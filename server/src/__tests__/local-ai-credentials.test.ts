@@ -8,8 +8,11 @@ vi.mock("node:fs/promises", () => ({ default: { readFile: mocks.readFile } }));
 afterEach(() => { vi.resetAllMocks(); vi.unstubAllGlobals(); });
 describe("explicit local subscription import", () => {
   it("verifies Claude only from the selected isolated home, never the host account", async () => {
-    mocks.credentialFile.mockResolvedValue(JSON.stringify({ claudeAiOauth: { accessToken: "isolated-claude" } }));
-    await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe("isolated-claude");
+    // A file login returns the whole document, so the refresh token survives.
+    // Quota verification still uses the extracted access token.
+    const document = JSON.stringify({ claudeAiOauth: { accessToken: "isolated-claude", refreshToken: "isolated-refresh" } });
+    mocks.credentialFile.mockResolvedValue(document);
+    await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe(document);
     expect(mocks.credentialFile).toHaveBeenCalledWith("/isolated/claude/.credentials.json");
     expect(mocks.claudeQuota).toHaveBeenCalledWith("isolated-claude");
     expect(mocks.claude).not.toHaveBeenCalled();
@@ -24,13 +27,15 @@ describe("explicit local subscription import", () => {
     expect(mocks.claudeQuota).not.toHaveBeenCalled();
   });
   it("tries the alternate Claude filename after malformed JSON", async () => {
-    mocks.credentialFile.mockResolvedValueOnce("malformed").mockResolvedValueOnce(JSON.stringify({ claudeAiOauth: { accessToken: "alternate-token" } }));
-    await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe("alternate-token");
+    const document = JSON.stringify({ claudeAiOauth: { accessToken: "alternate-token" } });
+    mocks.credentialFile.mockResolvedValueOnce("malformed").mockResolvedValueOnce(document);
+    await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe(document);
     expect(mocks.credentialFile).toHaveBeenLastCalledWith("/isolated/claude/credentials.json");
     expect(mocks.claude).not.toHaveBeenCalled();
   });
   it("verifies Claude's local credential, including explicit Keychain access", async () => {
     mocks.claude.mockResolvedValue("fixture-claude");
+    // A host login has no document either, so it keeps the bare-token shape.
     await expect(readVerifiedLocalAiCredential("anthropic")).resolves.toBe("fixture-claude");
     expect(mocks.claude).toHaveBeenCalledWith({ allowKeychain: true });
     expect(mocks.claudeQuota).toHaveBeenCalledWith("fixture-claude");
