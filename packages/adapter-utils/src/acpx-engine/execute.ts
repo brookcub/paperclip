@@ -2079,7 +2079,12 @@ async function buildRuntime(input: {
     packageRootDir: input.engine.packageRootDir,
     executionTargetIsRemote,
   });
-  let agentCommand = configuredCommand || builtInCommand?.command || null;
+  // Use the shell-quoted form for built-in agents: acpx parses agentCommand with
+  // splitCommandLine (which honors quotes), so an unquoted resolved bin PATH that
+  // contains spaces (e.g. C:\LynCo Root\...\claude-agent-acp.cmd) would be split on
+  // those spaces into a bogus command + args. shellCommand quotes it so it stays one
+  // token. (Multi-token built-ins like "gemini --acp" are unaffected.)
+  let agentCommand = configuredCommand || builtInCommand?.shellCommand || null;
   let agentCommandShell = configuredCommand || builtInCommand?.shellCommand || "";
   // A runner-backed remote sandbox is the only lane that crosses the staging
   // and serialized-launch-env seam. Runner-less ACP→CLI fallback, SSH, and
