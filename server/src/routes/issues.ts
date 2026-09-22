@@ -2856,15 +2856,40 @@ function diffExecutionParticipants(
   };
 }
 
+function isAuthenticatedSelfHandoff(input: {
+  actor: { type: string; agentId?: string | null; runId?: string | null };
+  previousAssigneeAgentId: string | null;
+  nextAssigneeAgentId: string | null;
+  nextAssigneeUserId: string | null;
+  activeRun: { id: string; agentId: string } | null;
+}) {
+  return (
+    input.activeRun !== null &&
+    input.actor.type === "agent" &&
+    input.actor.agentId === input.previousAssigneeAgentId &&
+    input.actor.runId === input.activeRun.id &&
+    input.activeRun.agentId === input.actor.agentId &&
+    input.nextAssigneeAgentId !== null &&
+    input.nextAssigneeUserId === null
+  );
+}
+
 function buildExecutionStageWakeup(input: {
   issueId: string;
   previousState: ParsedExecutionState | null;
   nextState: ParsedExecutionState | null;
   interruptedRunId: string | null;
+  selfHandoffSourceRunId: string | null;
   requestedByActorType: "user" | "agent";
   requestedByActorId: string;
 }) {
-  const { issueId, previousState, nextState, interruptedRunId } = input;
+  const {
+    issueId,
+    previousState,
+    nextState,
+    interruptedRunId,
+    selfHandoffSourceRunId,
+  } = input;
   if (!nextState) return null;
 
   if (nextState.status === "pending") {
@@ -2903,6 +2928,7 @@ function buildExecutionStageWakeup(input: {
           mutation: "update",
           executionStage,
           ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(selfHandoffSourceRunId ? { selfHandoffSourceRunId } : {}),
         },
         requestedByActorType: input.requestedByActorType,
         requestedByActorId: input.requestedByActorId,
@@ -2913,6 +2939,7 @@ function buildExecutionStageWakeup(input: {
           source: "issue.execution_stage",
           executionStage,
           ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(selfHandoffSourceRunId ? { selfHandoffSourceRunId } : {}),
         },
       },
     };
@@ -2949,6 +2976,7 @@ function buildExecutionStageWakeup(input: {
           mutation: "update",
           executionStage,
           ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(selfHandoffSourceRunId ? { selfHandoffSourceRunId } : {}),
         },
         requestedByActorType: input.requestedByActorType,
         requestedByActorId: input.requestedByActorId,
@@ -2959,6 +2987,7 @@ function buildExecutionStageWakeup(input: {
           source: "issue.execution_stage",
           executionStage,
           ...(interruptedRunId ? { interruptedRunId } : {}),
+          ...(selfHandoffSourceRunId ? { selfHandoffSourceRunId } : {}),
         },
       },
     };
@@ -13361,14 +13390,35 @@ export function issueRoutes(
         }
       }
 
+      let selfHandoffSourceRunId: string | null = null;
       if (assigneeWillChange && existing.assigneeAgentId) {
-        await stopRunnerGoalForOwnershipChange({
-          companyId: existing.companyId,
-          issueId: existing.id,
-          agentId: existing.assigneeAgentId,
-        });
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
-        if (runToStopForReassignment) {
+        const authenticatedSelfHandoff = isAuthenticatedSelfHandoff({
+          actor: req.actor,
+          previousAssigneeAgentId: existing.assigneeAgentId,
+          nextAssigneeAgentId,
+          nextAssigneeUserId,
+          activeRun: runToStopForReassignment,
+        });
+        const selfHandoffRun =
+          authenticatedSelfHandoff && runToStopForReassignment
+            ? runToStopForReassignment
+            : null;
+        if (selfHandoffRun) {
+          // The producing run is completing its own handoff. Preserve its
+          // normal completion and retain the target wake until cleanup releases
+          // the exact source run's execution ownership.
+          selfHandoffSourceRunId = selfHandoffRun.id;
+        } else {
+          await stopRunnerGoalForOwnershipChange({
+            companyId: existing.companyId,
+            issueId: existing.id,
+            agentId: existing.assigneeAgentId,
+          });
+        }
+        if (
+          runToStopForReassignment && !selfHandoffRun
+        ) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -14429,6 +14479,7 @@ export function issueRoutes(
         previousState: previousExecutionState,
         nextState: nextExecutionState,
         interruptedRunId,
+        selfHandoffSourceRunId,
         requestedByActorType: actor.actorType,
         requestedByActorId: actor.actorId,
       });
@@ -14528,6 +14579,7 @@ export function issueRoutes(
                 ? { resumeIntent: true, followUpRequested: true }
                 : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
+              ...(selfHandoffSourceRunId ? { selfHandoffSourceRunId } : {}),
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
@@ -14545,6 +14597,7 @@ export function issueRoutes(
                 ? { resumeIntent: true, followUpRequested: true }
                 : {}),
               ...(interruptedRunId ? { interruptedRunId } : {}),
+              ...(selfHandoffSourceRunId ? { selfHandoffSourceRunId } : {}),
             },
           });
         }
@@ -17681,6 +17734,7 @@ export function issueRoutes(
           previousState: currentExecutionState,
           nextState: parseIssueExecutionState(currentIssue.executionState),
           interruptedRunId,
+          selfHandoffSourceRunId: null,
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
         });

@@ -7,8 +7,10 @@ import {
   agentWakeupRequests,
   companies,
   createDb,
+  environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueTreeHolds,
   issues,
 } from "@paperclipai/db";
 import {
@@ -59,8 +61,10 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
   afterEach(async () => {
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     await db.delete(heartbeatRunEvents);
+    await db.delete(environmentLeases);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueTreeHolds);
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
@@ -79,6 +83,7 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     const issueId = randomUUID();
     const holderRunId = randomUUID();
     const wakeupRequestId = randomUUID();
+    const reviewStageId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
 
     await db.insert(companies).values({
@@ -143,6 +148,17 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       executionRunId: holderRunId,
       executionAgentNameKey: "coder",
       executionLockedAt: new Date(),
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
     });
@@ -154,6 +170,7 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       issueId,
       holderRunId,
       wakeupRequestId,
+      reviewStageId,
     };
   }
 
@@ -218,6 +235,328 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       .then((rows) => rows[0] ?? null);
 
     expect(issue?.executionRunId).toBe(holderRunId);
+  });
+
+  it("does not let a non-route wake turn a source-run id into a durable self-handoff", async () => {
+    const { companyId, reviewerAgentId, issueId, holderRunId } =
+      await seedCrossAgentScenario({ holderStatus: "running" });
+
+    const result = await heartbeatService(db).wakeup(reviewerAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      payload: { issueId, mutation: "update" },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "execution_review_requested",
+        source: "issue.execution_stage",
+        selfHandoffSourceRunId: holderRunId,
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "test",
+    });
+
+    expect(result).toBeNull();
+    const receipt = await db
+      .select({
+        id: agentWakeupRequests.id,
+        status: agentWakeupRequests.status,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+        ),
+      )
+      .then((rows) => rows[0]);
+    expect(receipt?.status).toBe("deferred_issue_execution");
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "interrupted", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, holderRunId));
+    const source = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, holderRunId))
+      .then((rows) => rows[0]!);
+    await heartbeatService(db).promoteDeferredSelfHandoffAfterCleanup(source);
+    expect(
+      await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, receipt!.id))
+        .then((rows) => rows[0]?.status),
+    ).toBe("deferred_issue_execution");
+  });
+
+  it("retains an authenticated self-handoff until its source lease releases, then queues its reviewer", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, reviewStageId } =
+      await seedCrossAgentScenario({ holderStatus: "running" });
+
+    // Prevent the promoted reviewer run from being immediately claimed by a
+    // worker, leaving the durable successor observable in this regression.
+    await db
+      .update(agents)
+      .set({
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      })
+      .where(eq(agents.id, reviewerAgentId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { wakeReason: "test_busy_slot" },
+      startedAt: new Date(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.wakeup(reviewerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      payload: {
+        issueId,
+        mutation: "update",
+        executionStage: { stageId: reviewStageId, stageType: "review" },
+      },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "execution_review_requested",
+        source: "issue.execution_stage",
+        executionStage: { stageId: reviewStageId, stageType: "review" },
+        selfHandoffSourceRunId: holderRunId,
+      },
+      requestedByActorType: "agent",
+      requestedByActorId: coderAgentId,
+    });
+
+    expect(result).toBeNull();
+    const [deferredBeforeCleanup] = await db
+      .select({
+        id: agentWakeupRequests.id,
+        status: agentWakeupRequests.status,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ),
+      );
+    expect(deferredBeforeCleanup).toBeDefined();
+    expect(deferredBeforeCleanup?.payload).toMatchObject({
+      _paperclipWakeContext: { selfHandoffSourceRunId: holderRunId },
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "interrupted",
+        finishedAt: new Date(),
+        runtimeMode: "legacy",
+        resultJson: { conversationContinuation: "continue_conversation_v1" },
+      })
+      .where(eq(heartbeatRuns.id, holderRunId));
+    const [lease] = await db
+      .insert(environmentLeases)
+      .values({
+        companyId,
+        issueId,
+        heartbeatRunId: holderRunId,
+        agentId: coderAgentId,
+        status: "active",
+      })
+      .returning();
+    const terminalSource = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, holderRunId))
+      .then((rows) => rows[0]!);
+
+    // This is the production finally hook immediately after lease release.
+    // A still-active lease must keep the successor deferred.
+    await heartbeat.promoteDeferredSelfHandoffAfterCleanup(terminalSource);
+    expect(
+      await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, deferredBeforeCleanup!.id))
+        .then((rows) => rows[0]?.status),
+    ).toBe("deferred_issue_execution");
+
+    await db
+      .update(environmentLeases)
+      .set({ status: "released", releasedAt: new Date() })
+      .where(eq(environmentLeases.id, lease!.id));
+    await heartbeat.promoteDeferredSelfHandoffAfterCleanup(terminalSource);
+
+    const promotedWake = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferredBeforeCleanup!.id))
+      .then((rows) => rows[0]);
+    expect(promotedWake?.status).toBe("queued");
+    expect(promotedWake?.runId).toEqual(expect.any(String));
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(issue?.executionRunId).toBe(promotedWake?.runId);
+  });
+
+  it("honors a pause hold created after a self-handoff before cleanup promotion", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, reviewStageId } =
+      await seedCrossAgentScenario({ holderStatus: "running" });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.wakeup(reviewerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      payload: {
+        issueId,
+        mutation: "update",
+        executionStage: { stageId: reviewStageId, stageType: "review" },
+      },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "execution_review_requested",
+        source: "issue.execution_stage",
+        executionStage: { stageId: reviewStageId, stageType: "review" },
+        selfHandoffSourceRunId: holderRunId,
+      },
+      requestedByActorType: "agent",
+      requestedByActorId: coderAgentId,
+    });
+    const deferred = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ),
+      )
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "interrupted",
+        finishedAt: new Date(),
+        runtimeMode: "legacy",
+        resultJson: { conversationContinuation: "continue_conversation_v1" },
+      })
+      .where(eq(heartbeatRuns.id, holderRunId));
+    await db.insert(issueTreeHolds).values({
+      companyId,
+      rootIssueId: issueId,
+      mode: "pause",
+      status: "active",
+      reason: "Operator pause after review handoff",
+    });
+    const terminalSource = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, holderRunId))
+      .then((rows) => rows[0]!);
+
+    await heartbeat.promoteDeferredSelfHandoffAfterCleanup(terminalSource);
+    const heldWake = await db
+      .select({ status: agentWakeupRequests.status, error: agentWakeupRequests.error })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferred.id))
+      .then((rows) => rows[0]);
+    expect(heldWake).toMatchObject({
+      status: "cancelled",
+      error: "Deferred wake suppressed by active subtree pause hold",
+    });
+  });
+
+  it("cancels a self-handoff when the review stage moves before cleanup promotion", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId, reviewStageId } =
+      await seedCrossAgentScenario({ holderStatus: "running" });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.wakeup(reviewerAgentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "execution_review_requested",
+      payload: {
+        issueId,
+        mutation: "update",
+        executionStage: { stageId: reviewStageId, stageType: "review" },
+      },
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "execution_review_requested",
+        source: "issue.execution_stage",
+        executionStage: { stageId: reviewStageId, stageType: "review" },
+        selfHandoffSourceRunId: holderRunId,
+      },
+      requestedByActorType: "agent",
+      requestedByActorId: coderAgentId,
+    });
+    const deferred = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, reviewerAgentId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ),
+      )
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "interrupted",
+        finishedAt: new Date(),
+        runtimeMode: "legacy",
+        resultJson: { conversationContinuation: "continue_conversation_v1" },
+      })
+      .where(eq(heartbeatRuns.id, holderRunId));
+    await db
+      .update(issues)
+      .set({
+        executionState: {
+          status: "pending",
+          currentStageId: randomUUID(),
+          currentStageIndex: 1,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      })
+      .where(eq(issues.id, issueId));
+    const terminalSource = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, holderRunId))
+      .then((rows) => rows[0]!);
+
+    await heartbeat.promoteDeferredSelfHandoffAfterCleanup(terminalSource);
+    const staleWake = await db
+      .select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, deferred.id))
+      .then((rows) => rows[0]);
+    expect(staleWake).toEqual({ status: "cancelled", runId: null });
   });
 
   // Race-guard regression: the cancel UPDATE for the queued holder is pinned

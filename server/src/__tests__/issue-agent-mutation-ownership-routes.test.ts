@@ -1114,6 +1114,98 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("keeps an authenticated producer running and marks its review handoff for post-cleanup delivery", async () => {
+    const existing = makeIssue({
+      executionRunId: ownerRunId,
+      executionPolicy: {
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: peerAgentId }],
+        }],
+      },
+    });
+    mockAgentService.resolveByReference.mockResolvedValue({
+      ambiguous: false,
+      agent: makeAgent(peerAgentId),
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...existing,
+      ...patch,
+    }));
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: ownerRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+
+    const app = await createApp(ownerActor());
+    const res = await request(app)
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "in_review" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        peerAgentId,
+        expect.objectContaining({
+          source: "assignment",
+          reason: "execution_review_requested",
+          payload: expect.objectContaining({
+            issueId,
+            selfHandoffSourceRunId: ownerRunId,
+          }),
+          contextSnapshot: expect.objectContaining({
+            source: "issue.execution_stage",
+            selfHandoffSourceRunId: ownerRunId,
+          }),
+        }),
+      );
+    });
+  }, 45_000);
+
+  it("still stops an active run when a different actor reassigns the issue", async () => {
+    const existing = makeIssue({ executionRunId: ownerRunId });
+    mockAgentService.resolveByReference.mockResolvedValue({
+      ambiguous: false,
+      agent: makeAgent(peerAgentId),
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue({
+      ...existing,
+      assigneeAgentId: peerAgentId,
+      assigneeUserId: null,
+    });
+    mockHeartbeatService.getRun.mockResolvedValue({
+      id: ownerRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "running",
+      contextSnapshot: { issueId },
+    });
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: ownerRunId,
+      companyId,
+      agentId: ownerAgentId,
+      status: "cancelled",
+    });
+
+    const res = await request(await createApp(boardActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: peerAgentId, assigneeUserId: null });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      ownerRunId,
+      "Cancelled before issue reassignment",
+      expect.objectContaining({ errorCode: "issue_reassigned" }),
+    );
+  }, 45_000);
+
   it("stores the authenticated agent run id when creating work products", async () => {
     const app = await createApp(ownerActor());
 

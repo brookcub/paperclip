@@ -25545,6 +25545,9 @@ export function heartbeatService(
             providerResourceDisposition: providerResourceDispositionForRun,
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           });
+          if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+            await promoteDeferredSelfHandoffAfterCleanup(latestRun);
+          }
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
         }
         if (
@@ -25679,6 +25682,109 @@ export function heartbeatService(
       }
       throw error;
     }
+  }
+
+  /**
+   * An authenticated producer can hand work to another agent without asking
+   * the control plane to cancel itself. Its successor is retained only while
+   * that exact producer owns execution, then re-enters ordinary queue
+   * promotion after the producer has released its environment lease.
+   */
+  async function promoteDeferredSelfHandoffAfterCleanup(
+    run: typeof heartbeatRuns.$inferSelect,
+  ) {
+    const issueId = readNonEmptyString(run.contextSnapshot?.issueId);
+    if (!issueId) return;
+    const deferredCandidates = await db
+      .select({
+        id: agentWakeupRequests.id,
+        agentId: agentWakeupRequests.agentId,
+        source: agentWakeupRequests.source,
+        triggerDetail: agentWakeupRequests.triggerDetail,
+        requestedByActorType: agentWakeupRequests.requestedByActorType,
+        requestedByActorId: agentWakeupRequests.requestedByActorId,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, run.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        ),
+      );
+    const deferred = deferredCandidates.find(
+      (candidate) =>
+        candidate.source === "assignment" &&
+        candidate.triggerDetail === "system" &&
+        candidate.requestedByActorType === "agent" &&
+        candidate.requestedByActorId === run.agentId &&
+        parseObject(candidate.payload).mutation === "update" &&
+        ["issue.update", "issue.execution_stage"].includes(
+          readNonEmptyString(
+            parseObject(
+              parseObject(candidate.payload)[DEFERRED_WAKE_CONTEXT_KEY],
+            ).source,
+          ) ?? "",
+        ) &&
+        readNonEmptyString(
+          parseObject(
+            parseObject(candidate.payload)[DEFERRED_WAKE_CONTEXT_KEY],
+          ).selfHandoffSourceRunId,
+        ) === run.id,
+    );
+    if (!deferred) return;
+    const [issue] = await db
+      .select({
+        assigneeAgentId: issues.assigneeAgentId,
+        executionState: issues.executionState,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+      .limit(1);
+    const executionState = parseIssueExecutionState(issue?.executionState);
+    const deferredContext = parseObject(
+      parseObject(deferred.payload)[DEFERRED_WAKE_CONTEXT_KEY],
+    );
+    const deferredExecutionStage = parseObject(deferredContext.executionStage);
+    const expectedStageId = readNonEmptyString(deferredExecutionStage.stageId);
+    const expectedStageType = readNonEmptyString(deferredExecutionStage.stageType);
+    const currentParticipantAgentId =
+      executionState?.status === "pending" &&
+      executionState.currentParticipant?.type === "agent"
+        ? executionState.currentParticipant.agentId ?? null
+        : executionState?.status === "changes_requested" &&
+            executionState.returnAssignee?.type === "agent"
+          ? executionState.returnAssignee.agentId ?? null
+          : issue?.assigneeAgentId ?? null;
+    const stageStillMatches =
+      expectedStageId === null ||
+      (executionState !== null &&
+        executionState.currentStageId === expectedStageId &&
+        (expectedStageType === null ||
+          executionState.currentStageType === expectedStageType));
+    if (currentParticipantAgentId !== deferred.agentId || !stageStillMatches) {
+      await db
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          finishedAt: new Date(),
+          error: "Deferred self-handoff no longer matches the current issue participant or stage",
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, deferred.id),
+            eq(agentWakeupRequests.companyId, run.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ),
+        );
+      return;
+    }
+    if (await getExecutionBlocker(db, run.companyId, issueId)) return;
+    await releaseIssueExecutionAndPromote(run, {
+      suppressImmediateRecovery: true,
+    });
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
@@ -26597,6 +26703,21 @@ export function heartbeatService(
             executionBlocker: NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>,
           ) => {
             const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
+            const selfHandoffSourceRunId = readNonEmptyString(
+              enrichedContextSnapshot.selfHandoffSourceRunId,
+            );
+            const isRouteIssuedSelfHandoff =
+              source === "assignment" &&
+              triggerDetail === "system" &&
+              payload?.mutation === "update" &&
+              (enrichedContextSnapshot.source === "issue.update" ||
+                enrichedContextSnapshot.source === "issue.execution_stage") &&
+              opts.requestedByActorType === "agent" &&
+              opts.requestedByActorId === executionBlocker.agentId;
+            const selfHandoffBlockedBySource =
+              isRouteIssuedSelfHandoff &&
+              selfHandoffSourceRunId !== null &&
+              executionBlocker.runId === selfHandoffSourceRunId;
             if (executionWaitRequestId) {
               await tx.update(agentWakeupRequests).set({
                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
@@ -26604,7 +26725,12 @@ export function heartbeatService(
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
             }
-            if (durableRequest || wakeCommentId || hasInteractionContinuationWakeContext(enrichedContextSnapshot)) {
+            if (
+              durableRequest ||
+              wakeCommentId ||
+              hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
+              selfHandoffBlockedBySource
+            ) {
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
                 companyId: agent.companyId, agentId, source, triggerDetail, reason,
@@ -29057,6 +29183,9 @@ export function heartbeatService(
     terminalizeRunOnLeaseRelease,
 
     releaseEnvironmentLeasesForRun,
+    // Kept public with the adjacent cleanup primitives so the lease-release
+    // boundary can be regression-tested without invoking a full runner.
+    promoteDeferredSelfHandoffAfterCleanup,
     resumeRemoteStopComments,
     resumeQueuedCommentInterrupt,
     resumeExecutionWaitComments,
