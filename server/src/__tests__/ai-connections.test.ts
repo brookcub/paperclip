@@ -96,7 +96,15 @@ describe("managed AI connections", () => {
       const env = run.config.env as Record<string, string>;
       expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("");
       expect(await readFile(path.join(env.CLAUDE_CONFIG_DIR, ".credentials.json"), "utf8")).toBe(document);
+      // Simulate the CLI rotating both tokens in its private credential file.
+      await writeFile(path.join(env.CLAUDE_CONFIG_DIR, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "fixture-rotated-access", refreshToken: "fixture-rotated-refresh", expiresAt: 2000 } }));
     } finally { await run.cleanup(); }
+    const nextRun = await prepareManagedAiRuntime(db, { ...input, binding: { provider: "anthropic", method: "subscription", mode: "responsible_user" } as const, responsibleUserId: userId, config: { env: {} } });
+    try {
+      const env = nextRun.config.env as Record<string, string>;
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("");
+      expect(JSON.parse(await readFile(path.join(env.CLAUDE_CONFIG_DIR, ".credentials.json"), "utf8"))).toEqual({ claudeAiOauth: { accessToken: "fixture-rotated-access", refreshToken: "fixture-rotated-refresh", expiresAt: 2000 } });
+    } finally { await nextRun.cleanup(); }
   });
 
   it("has one provider default across methods, retains unavailable defaults and honors explicit account methods", async () => {

@@ -1,7 +1,7 @@
 import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { readClaudeToken, fetchClaudeQuota } from "@paperclipai/adapter-claude-local/server";
+import { claudeConfigDir, readClaudeToken, fetchClaudeQuota } from "@paperclipai/adapter-claude-local/server";
 import { readCodexAuthInfo, fetchCodexQuota } from "@paperclipai/adapter-codex-local/server";
 import { parseGrokAuthPayload, hasUsableGrokAuthValue } from "@paperclipai/adapter-grok-local/server";
 import type { AiProvider } from "@paperclipai/shared";
@@ -17,27 +17,30 @@ export async function readVerifiedLocalAiCredential(provider: AiProvider, loginH
       // Never change process.env or fall back to the server account when an
       // authenticated user's isolated login is missing or invalid.
       let token: string | null = null;
-      // The whole credential document, when the login home holds one. Claude
+      // The whole credential document, when the selected account holds one. Claude
       // Code rotates the short-lived access token in place, so keeping only the
       // token discards the refresh token that carries the connection past the
       // token's expiry.
       let document: string | null = null;
-      if (loginHome) {
-        for (const name of [".credentials.json", "credentials.json"]) {
-          const raw = await readLocalAiCredentialFile(path.join(loginHome, name)).catch(() => null);
-          if (!raw) continue;
-          let parsed;
-          try { parsed = JSON.parse(raw); } catch { continue; }
-          const value = parsed?.claudeAiOauth?.accessToken;
-          if (typeof value === "string" && value.length) { token = value; document = raw; break; }
-        }
-      } else {
-        token = await readClaudeToken({ allowKeychain: true });
+      const configDir = loginHome ?? claudeConfigDir();
+      for (const name of [".credentials.json", "credentials.json"]) {
+        const filename = path.join(configDir, name);
+        // Host import already permits these reads through readClaudeToken,
+        // including on Windows. Isolated sign-ins keep their stricter reader.
+        const raw = await (loginHome
+          ? readLocalAiCredentialFile(filename)
+          : fs.readFile(filename, "utf8")).catch(() => null);
+        if (!raw) continue;
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch { continue; }
+        const value = parsed?.claudeAiOauth?.accessToken;
+        if (typeof value === "string" && value.length) { token = value; document = raw; break; }
       }
+      if (!token && !loginHome) token = await readClaudeToken({ allowKeychain: true });
       if (!token) throw new Error("Missing login");
       await fetchClaudeQuota(token);
-      // A keychain or host login yields no document. Those keep the legacy
-      // bare-token shape, and the env-var delivery that goes with it.
+      // A token-only fallback keeps legacy env-var delivery. File-backed host
+      // and isolated logins preserve refresh credentials for file rotation.
       return document ?? token;
     }
     if (provider === "openai") {
