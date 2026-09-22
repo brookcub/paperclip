@@ -1,21 +1,23 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { buildLocalAdapterTestProbeEnv } from "./probe-env.js";
+import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 
 const tempDirs: string[] = [];
 
 async function makeTrustedPathWithClaude(): Promise<{ dir: string; claudePath: string }> {
   const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-probe-env-"));
   tempDirs.push(dir);
-  const claudePath = path.join(dir, "claude");
+  const claudePath = path.join(dir, process.platform === "win32" ? "claude.EXE" : "claude");
   await writeFile(claudePath, "#!/bin/sh\nexit 0\n");
   await chmod(claudePath, 0o755);
   return { dir, claudePath };
 }
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
@@ -23,6 +25,30 @@ afterEach(async () => {
 });
 
 describe("buildLocalAdapterTestProbeEnv", () => {
+  it("keeps managed auth clears through the real child launcher instead of inheriting host credentials", async () => {
+    const { dir } = await makeTrustedPathWithClaude();
+    const keys = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+    for (const key of keys) vi.stubEnv(key, "fixture-host-credential");
+    const built = await buildLocalAdapterTestProbeEnv({
+      callerEnv: {
+        ...Object.fromEntries(keys.map((key) => [key, ""])),
+        CLAUDE_CONFIG_DIR: dir,
+      },
+      trustedEnv: { PATH: dir },
+    });
+    const probe = await runChildProcess("probe-auth-clears", process.execPath, [
+      "-e",
+      `process.stdout.write(JSON.stringify(${JSON.stringify(keys)}.map(key => Boolean(process.env[key]))))`,
+    ], {
+      cwd: dir, env: built.env, timeoutSec: 10, graceSec: 1,
+      onLog: async () => {},
+    });
+    expect(probe.exitCode).toBe(0);
+    expect(JSON.parse(probe.stdout)).toEqual([false, false, false]);
+    expect(built.env.CLAUDE_CONFIG_DIR).toBe(dir);
+    for (const key of keys) expect(built.env[key]).toBe("");
+  });
+
   it("resolves claude from the trusted PATH and ignores the caller PATH", async () => {
     const { dir, claudePath } = await makeTrustedPathWithClaude();
     const built = await buildLocalAdapterTestProbeEnv({

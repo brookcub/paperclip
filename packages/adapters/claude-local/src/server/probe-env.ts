@@ -156,7 +156,9 @@ export async function buildLocalAdapterTestProbeEnv(input: {
   // never in the allowlist, so a caller cannot pass them here.
   for (const key of LOCAL_PROBE_ALLOWED_CALLER_ENV_KEYS) {
     const value = readCaseInsensitive(input.callerEnv, key);
-    if (isNonEmptyString(value)) {
+    // Empty values deliberately clear inherited host authentication. Dropping
+    // them lets the child launcher restore a host API key over a subscription.
+    if (typeof value === "string") {
       env[key] = value;
     }
   }
