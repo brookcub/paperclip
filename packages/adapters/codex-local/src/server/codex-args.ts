@@ -55,6 +55,15 @@ export function buildCodexExecArgs(
   const extraArgs = readExtraArgs(record);
 
   const args = ["exec", "--json"];
+  // Managed AI homes do not inherit host config.toml. Select the native
+  // Windows sandbox explicitly without allowing arbitrary auth overrides.
+  const windowsSandbox = asString(record.windowsSandbox, "").trim();
+  if (windowsSandbox) {
+    if (windowsSandbox !== "elevated" && windowsSandbox !== "unelevated") {
+      throw new Error("windowsSandbox must be elevated or unelevated");
+    }
+    args.push("-c", `windows.sandbox=${JSON.stringify(windowsSandbox)}`);
+  }
   // `codex exec` otherwise defaults to read-only/never, which cannot perform
   // Paperclip work. Keep the sandbox, but make unattended workspace work and
   // API calls possible. Explicit operator modes/profiles retain their meaning.
