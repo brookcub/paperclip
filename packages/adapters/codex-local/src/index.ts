@@ -123,6 +123,7 @@ Core fields:
 - dangerouslyBypassApprovalsAndSandbox (boolean, optional): run with bypass flag
 - windowsSandbox (string, optional): native Windows sandbox mode, "elevated" or "unelevated"; CLI engine only. Required when an isolated managed home has no Windows sandbox configuration. Select a mode supported by the host; this does not enable bypass or configure ACP.
 - command (string, optional): defaults to "codex"
+- managedMcpToolApprovals (array, optional, CLI only): per-agent Codex tool policy entries { server, tool, approvalMode }. Server must exactly match an active managed gateway's original name; tool is an exact MCP tool identifier (no wildcards). Modes: auto|prompt|writes|approve. Example: [{ "server": "paperclip-projects", "tool": "create_task", "approvalMode": "approve" }]. Only the named tools receive an override, including when a managed server is renamed to avoid an unmanaged collision. Does not change Paperclip authorization, authentication, other tool defaults or filesystem sandboxing. Removing entries removes their overrides on the next run. Invalid/duplicate entries or missing gateways fail before config is written. Configure through adapterConfig in the agent API; no machine-wide or project trust change is needed.
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
 - workspaceStrategy (object, optional): execution workspace strategy; currently supports { type: "git_worktree", baseRef?, branchTemplate?, worktreeParentDir? }

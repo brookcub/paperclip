@@ -582,6 +582,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
   if (engineSelection.engine === "acp") {
+    if (ctx.config.managedMcpToolApprovals !== undefined) {
+      throw new Error("managedMcpToolApprovals requires the Codex CLI engine");
+    }
     return executeCodexAcp(ctx);
   }
 
@@ -766,6 +769,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       codexHome: effectiveCodexHome,
       apiBaseUrl: paperclipBaseEnv.PAPERCLIP_API_URL,
       gateways: managedMcpGateways,
+      toolApprovals: config.managedMcpToolApprovals,
     });
     if (managedMcpGateways.length > 0) {
       await onLog(

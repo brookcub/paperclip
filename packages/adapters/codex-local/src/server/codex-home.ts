@@ -285,10 +285,48 @@ function readCodexMcpServerNames(config: string): Set<string> {
   return names;
 }
 
+type ManagedMcpToolApproval = {
+  server: string;
+  tool: string;
+  approvalMode: "auto" | "prompt" | "writes" | "approve";
+};
+
+/** Only typed per-tool policy is accepted; transport, credentials and defaults stay managed. */
+function parseManagedMcpToolApprovals(
+  value: unknown,
+  gateways: ManagedCodexMcpGateway[],
+): ManagedMcpToolApproval[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("managedMcpToolApprovals must be an array");
+  const seen = new Set<string>();
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)
+      || Object.keys(entry).some((key) => !["server", "tool", "approvalMode"].includes(key))) {
+      throw new Error("managedMcpToolApprovals entries require only server, tool and approvalMode");
+    }
+    const { server, tool, approvalMode } = entry;
+    if (typeof server !== "string" || !server
+      || gateways.filter((gateway) => gateway.name === server).length !== 1) {
+      throw new Error("managedMcpToolApprovals server must identify exactly one active managed gateway");
+    }
+    if (typeof tool !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(tool)) {
+      throw new Error("managedMcpToolApprovals tool must be an exact MCP tool name");
+    }
+    if (!["auto", "prompt", "writes", "approve"].includes(approvalMode)) {
+      throw new Error("managedMcpToolApprovals approvalMode must be auto, prompt, writes or approve");
+    }
+    const key = JSON.stringify([server, tool]);
+    if (seen.has(key)) throw new Error("managedMcpToolApprovals contains a duplicate server/tool pair");
+    seen.add(key);
+    return { server, tool, approvalMode };
+  });
+}
+
 function buildManagedMcpBlock(input: {
   gateways: ManagedCodexMcpGateway[];
   apiBaseUrl: string;
   existingNames: Set<string>;
+  toolApprovals: ManagedMcpToolApproval[];
 }): { block: string; warnings: string[] } {
   const warnings: string[] = [];
   const usedNames = new Set<string>();
@@ -318,6 +356,13 @@ function buildManagedMcpBlock(input: {
       `url = ${tomlString(url)}`,
       `http_headers = { Authorization = ${tomlString(`Bearer ${gateway.bearerToken}`)} }`,
     );
+    for (const policy of input.toolApprovals.filter((entry) => entry.server === gateway.name)) {
+      lines.push(
+        "",
+        `[mcp_servers.${tomlString(managedName)}.tools.${tomlString(policy.tool)}]`,
+        `approval_mode = ${tomlString(policy.approvalMode)}`,
+      );
+    }
   });
   lines.push(MANAGED_MCP_BLOCK_END);
   return { block: lines.join("\n"), warnings };
@@ -327,7 +372,10 @@ export async function writeManagedCodexMcpConfig(input: {
   codexHome: string;
   apiBaseUrl: string;
   gateways: ManagedCodexMcpGateway[];
+  toolApprovals?: unknown;
 }): Promise<{ configPath: string; warnings: string[] }> {
+  // Validate before touching the existing config, including an empty runtime set.
+  const toolApprovals = parseManagedMcpToolApprovals(input.toolApprovals, input.gateways);
   const configPath = path.join(input.codexHome, "config.toml");
   await fs.mkdir(input.codexHome, { recursive: true });
   const existing = await fs.readFile(configPath, "utf8").catch((error) => {
@@ -339,6 +387,7 @@ export async function writeManagedCodexMcpConfig(input: {
     gateways: input.gateways,
     apiBaseUrl: input.apiBaseUrl,
     existingNames: readCodexMcpServerNames(unmanagedConfig),
+    toolApprovals,
   });
   const next = input.gateways.length > 0
     ? `${unmanagedConfig}${unmanagedConfig ? "\n\n" : ""}${block}\n`
