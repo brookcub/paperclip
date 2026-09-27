@@ -46,7 +46,7 @@ describe("required capability preflight", () => {
       expect.objectContaining({ id: "skill:ponytail-skill", state: "missing" }),
       expect.objectContaining({ id: "permission:agents:suggest-changes", state: "missing" }),
     ]));
-    expect(result.admittedCatalog).toEqual([]);
+    expect(result.admittedCatalog).toEqual(["tool:claude_cli:Bash"]);
   });
 
   it("labels an unavailable selected skill source without implying a required pin", () => {
