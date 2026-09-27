@@ -37,7 +37,7 @@ import {
   selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
   resolveLegacyPaperclipDesiredSkillNames,
-  stringifyPaperclipWakePayload,
+  preparePaperclipWakePayloadTransport,
   refreshPaperclipWorkspaceEnvForExecution,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
@@ -285,7 +285,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const linkedIssueIds = Array.isArray(context.issueIds)
       ? context.issueIds.filter((value: unknown): value is string => typeof value === "string" && value.trim().length > 0)
       : [];
-    const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+    const wakePayloadTransport = await preparePaperclipWakePayloadTransport({
+      wake: context.paperclipWake,
+      scratch: context.paperclipScratch,
+      companyId: agent.companyId,
+      agentId: agent.id,
+      runId,
+    });
+    wakePayloadTransport.applyToEnv(env);
     const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
     if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
     if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -294,7 +301,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
     if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
     if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-    if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
     refreshPaperclipWorkspaceEnvForExecution({
       env,
       envConfig,
@@ -362,8 +368,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         detectCommand: ctx.runtimeCommandSpec?.detectCommand ?? command,
         onProgress: (line) => onLog("stdout", line),
         onRuntimeProgress: ctx.onRuntimeProgress,
-        assets: stagedGrokHomeDir
+        assets: wakePayloadTransport.asset || stagedGrokHomeDir
           ? [
+              ...(wakePayloadTransport.asset ? [wakePayloadTransport.asset] : []),
               {
                 key: "home",
                 localDir: stagedGrokHomeDir,
@@ -386,7 +393,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                   }).catch(() => undefined)),
               },
             ]
-          : undefined,
+          : wakePayloadTransport.asset ? [wakePayloadTransport.asset] : undefined,
       });
       restoreRemoteWorkspace = () =>
         preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line));
@@ -403,6 +410,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         agentHome,
         executionTargetIsRemote,
         executionCwd: effectiveExecutionCwd,
+      });
+      wakePayloadTransport.applyToEnv(env, {
+        remote: true,
+        remoteAssetDir: preparedExecutionTargetRuntime.assetDirs["wake-payload"] ?? null,
       });
       // Set GROK_HOME after the refresh above, so the refresh cannot overwrite
       // it. The fixed fallback path mirrors `prepareAdapterExecutionTargetRuntime`'s

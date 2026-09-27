@@ -48,7 +48,7 @@ import {
   selectPaperclipTaskMarkdown,
   rewriteWorkspaceCwdEnvVarsForExecution,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
+  preparePaperclipWakePayloadTransport,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -241,7 +241,14 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  const wakePayloadTransport = await preparePaperclipWakePayloadTransport({
+    wake: context.paperclipWake,
+    scratch: context.paperclipScratch,
+    companyId: agent.companyId,
+    agentId: agent.id,
+    runId,
+  });
+  wakePayloadTransport.applyToEnv(env);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
 
   if (wakeTaskId) {
@@ -264,9 +271,6 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   }
   if (linkedIssueIds.length > 0) {
     env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  }
-  if (wakePayloadJson) {
-    env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   }
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
@@ -624,6 +628,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           onProgress: (line) => onLog("stdout", line),
           onRuntimeProgress: ctx.onRuntimeProgress,
           assets: [
+            ...(wakePayloadTransport.asset ? [wakePayloadTransport.asset] : []),
             {
               key: "skills",
               localDir: promptBundle.addDir,
@@ -664,6 +669,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     agentHome,
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
+  });
+  wakePayloadTransport.applyToEnv(env, {
+    remote: executionTargetIsRemote,
+    remoteAssetDir: preparedExecutionTargetRuntime?.assetDirs["wake-payload"] ?? null,
   });
   const restoreRemoteWorkspace = preparedExecutionTargetRuntime
     ? () => preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line))

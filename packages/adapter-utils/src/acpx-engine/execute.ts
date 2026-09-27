@@ -72,7 +72,7 @@ import {
   removeMaintainerOnlySkillSymlinks,
   rewriteWorkspaceCwdEnvVarsForExecution,
   shapePaperclipWorkspaceEnvForExecution,
-  stringifyPaperclipWakePayload,
+  preparePaperclipWakePayloadTransport,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -1912,7 +1912,13 @@ async function buildRuntime(input: {
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  const wakePayloadTransport = await preparePaperclipWakePayloadTransport({
+    wake: context.paperclipWake,
+    scratch: context.paperclipScratch,
+    companyId: agent.companyId,
+    agentId: agent.id,
+    runId,
+  });
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
@@ -1921,7 +1927,7 @@ async function buildRuntime(input: {
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  wakePayloadTransport.applyToEnv(env);
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
     workspaceSource,
@@ -2177,6 +2183,7 @@ async function buildRuntime(input: {
     // edits and same-version secret rotations. Per-wake runtime vars never enter
     // resolvedAdapterEnv, so they don't churn the fingerprint every heartbeat.
     adapterEnvHash: shortHash(resolvedAdapterEnv),
+    wakePayloadAssetHash: wakePayloadTransport.contentHash,
   };
   const fingerprint = buildSessionFingerprint(fingerprintIdentity);
   const taskKey = asString(input.ctx.runtime.taskKey, "") || wakeTaskId || workspaceId || "default";
@@ -2267,7 +2274,10 @@ async function buildRuntime(input: {
           workspaceLocalDir: cwd,
           workspaceRemoteDir: sessionCwd,
           timeoutSec,
-          assets,
+          assets: [
+            ...assets,
+            ...(wakePayloadTransport.asset ? [wakePayloadTransport.asset] : []),
+          ],
           additionalSources,
           onLog: input.ctx.onLog,
           onRuntimeProgress: input.ctx.onRuntimeProgress,
@@ -2378,6 +2388,10 @@ async function buildRuntime(input: {
     await emitRunPhaseTiming(input.ctx, "place_workspace", nowMs() - placeWorkspaceStart, "ok");
     const placedStaged = sandboxSite.staged;
     stagedRuntime = placedStaged?.stagedRuntime ?? null;
+    wakePayloadTransport.applyToEnv(env, {
+      remote: true,
+      remoteAssetDir: stagedRuntime?.assetDirs["wake-payload"] ?? null,
+    });
     remoteManagedHomeTeardown = placedStaged?.teardown ?? null;
     remoteStagingDispose = placedStaged?.dispose ?? null;
     remoteStagingEnvDelta = placedStaged?.envDelta ?? null;

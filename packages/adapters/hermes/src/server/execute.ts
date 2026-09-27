@@ -38,6 +38,7 @@ import {
   joinPromptSections,
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
+  preparePaperclipWakePayloadTransport,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -509,8 +510,14 @@ export async function execute(
   if (envWakeReason) env.PAPERCLIP_WAKE_REASON = envWakeReason;
   const envCommentId = cfgString(ctxContext.commentId) || cfgString(ctxContext.wakeCommentId) || cfgString(ctx.config?.commentId);
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
-  const wakePayloadJson = stringifyPaperclipWakePayload(ctxContext.paperclipWake);
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  const wakePayloadTransport = await preparePaperclipWakePayloadTransport({
+    wake: ctxContext.paperclipWake,
+    scratch: ctxContext.paperclipScratch,
+    companyId: ctx.agent.companyId,
+    agentId: ctx.agent.id,
+    runId: ctx.runId,
+  });
+  wakePayloadTransport.applyToEnv(env);
 
   // ── Resolve working directory ──────────────────────────────────────────
   const cwd =

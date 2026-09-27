@@ -456,6 +456,8 @@ export interface SessionFingerprintIdentity {
   readonly mcpServers: readonly McpServerIdentity[];
   readonly secretManifestHash: string;
   readonly adapterEnvHash: string;
+  /** File-backed wake payloads must restage when their exact content changes. */
+  readonly wakePayloadAssetHash: string | null;
 }
 
 /**

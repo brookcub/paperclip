@@ -20,7 +20,11 @@ import {
   isPaperclipExternalChatQuestionResponseTurn,
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
+  MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
+  PAPERCLIP_WAKE_PAYLOAD_JSON_ENV,
+  PAPERCLIP_WAKE_PAYLOAD_PATH_ENV,
+  preparePaperclipWakePayloadTransport,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -37,6 +41,73 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+describe("wake payload environment transport", () => {
+  it("keeps small JSON inline and clears stale alternate transport values", async () => {
+    const transport = await preparePaperclipWakePayloadTransport({
+      wake: { reason: "issue_commented", commentWindow: {} },
+      scratch: null,
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    });
+    const env: Record<string, string> = {
+      [PAPERCLIP_WAKE_PAYLOAD_JSON_ENV]: "stale",
+      [PAPERCLIP_WAKE_PAYLOAD_PATH_ENV]: "stale-path",
+    };
+    transport.applyToEnv(env);
+    expect(transport.asset).toBeNull();
+    expect(env[PAPERCLIP_WAKE_PAYLOAD_PATH_ENV]).toBeUndefined();
+    expect(JSON.parse(env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV] ?? "{}")).toMatchObject({
+      reason: "issue_commented",
+    });
+  });
+
+  it("uses an exact private file for a >72KB multibyte wake and maps it for a remote runtime", async () => {
+    const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-wake-transport-"));
+    const owner = { companyId: "company-1", agentId: "agent-1", runId: "run-1" };
+    try {
+      await fs.writeFile(
+        path.join(scratchDir, ".paperclip-run-scratch.json"),
+        JSON.stringify({ version: 1, ...owner, issueId: null, issueIdentifier: null, createdAt: new Date().toISOString() }),
+        "utf8",
+      );
+      const wake = {
+        reason: "issue_commented",
+        issue: { id: "issue-1", identifier: "PAP-1", title: "wake", status: "in_progress", workMode: "standard" },
+        comments: [{ id: "comment-1", body: "😀".repeat(37_000), author: { type: "user", id: "user-1" }, createdAt: "2026-09-26T00:00:00.000Z" }],
+        commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
+      };
+      const expected = stringifyPaperclipWakePayload(wake);
+      expect(expected?.length).toBeGreaterThan(MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS);
+      expect(Buffer.byteLength(expected ?? "", "utf8")).toBeGreaterThan(72_000);
+
+      const transport = await preparePaperclipWakePayloadTransport({ wake, scratch: { type: "heartbeat_run", dir: scratchDir, marker: ".paperclip-run-scratch.json" }, ...owner });
+      expect(transport.asset?.key).toBe("wake-payload");
+
+      const remoteEnv: Record<string, string> = { [PAPERCLIP_WAKE_PAYLOAD_JSON_ENV]: "stale" };
+      transport.applyToEnv(remoteEnv, { remote: true, remoteAssetDir: "/run/.paperclip-runtime/claude/wake-payload" });
+      expect(remoteEnv).toEqual({ [PAPERCLIP_WAKE_PAYLOAD_PATH_ENV]: "/run/.paperclip-runtime/claude/wake-payload/payload.json" });
+
+      const env: Record<string, string> = { KEEP_ENV: "unchanged", [PAPERCLIP_WAKE_PAYLOAD_JSON_ENV]: "stale", [PAPERCLIP_WAKE_PAYLOAD_PATH_ENV]: "stale" };
+      transport.applyToEnv(env);
+      const script = "const fs=require('node:fs');process.stdout.write(JSON.stringify({keep:process.env.KEEP_ENV,inline:process.env.PAPERCLIP_WAKE_PAYLOAD_JSON,path:process.env.PAPERCLIP_WAKE_PAYLOAD_PATH,payload:fs.readFileSync(process.env.PAPERCLIP_WAKE_PAYLOAD_PATH,'utf8')}));";
+      const stdout = await new Promise<string>((resolve, reject) => {
+        const child = spawn(process.execPath, ["-e", script], { cwd: scratchDir, env });
+        let output = "";
+        child.stdout.on("data", (chunk) => { output += chunk.toString(); });
+        child.once("error", reject);
+        child.once("close", (code) => code === 0 ? resolve(output) : reject(new Error(`child exited ${code}`)));
+      });
+      const child = JSON.parse(stdout) as Record<string, string | undefined>;
+      expect(child.keep).toBe("unchanged");
+      expect(child.inline).toBeUndefined();
+      expect(child.payload).toBe(expected);
+    } finally {
+      await fs.rm(scratchDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("runtime connection tool delivery", () => {
   const access = {

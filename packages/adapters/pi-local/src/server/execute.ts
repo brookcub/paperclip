@@ -47,7 +47,7 @@ import {
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
-  stringifyPaperclipWakePayload,
+  preparePaperclipWakePayloadTransport,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   runChildProcess,
@@ -302,7 +302,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
     : [];
-  const wakePayloadJson = stringifyPaperclipWakePayload(context.paperclipWake);
+  const wakePayloadTransport = await preparePaperclipWakePayloadTransport({
+    wake: context.paperclipWake,
+    scratch: context.paperclipScratch,
+    companyId: agent.companyId,
+    agentId: agent.id,
+    runId,
+  });
+  wakePayloadTransport.applyToEnv(env);
   const issueWorkMode = readPaperclipIssueWorkModeFromContext(context);
     
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
@@ -312,7 +319,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
   refreshPaperclipWorkspaceEnvForExecution({
     env,
     envConfig,
@@ -431,6 +437,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           onProgress: (line) => onLog("stdout", line),
           onRuntimeProgress: ctx.onRuntimeProgress,
           assets: [
+            ...(wakePayloadTransport.asset ? [wakePayloadTransport.asset] : []),
             {
               key: "skills",
               localDir: localSkillsDir,
@@ -459,6 +466,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           agentHome,
           executionTargetIsRemote,
           executionCwd: effectiveExecutionCwd,
+        });
+        wakePayloadTransport.applyToEnv(env, {
+          remote: true,
+          remoteAssetDir: preparedRemoteRuntime.assetDirs["wake-payload"] ?? null,
         });
         if (adapterExecutionTargetUsesManagedHome(executionTarget) && preparedRemoteRuntime.runtimeRootDir) {
           env.HOME = preparedRemoteRuntime.runtimeRootDir;

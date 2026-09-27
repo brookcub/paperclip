@@ -218,6 +218,7 @@ export const DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE = [
   "- If woken by a human comment on a dependency-blocked issue, respond or triage the comment without treating the blocked deliverable work as unblocked.",
   "- Create child issues directly when you know what needs to be done; use issue-thread interactions when the board/user must choose suggested tasks, answer structured questions, or confirm a proposal.",
   "- Use `PAPERCLIP_SCRATCH_DIR` / `PAPERCLIP_RUN_SCRATCH_DIR` for temporary scratch files instead of ad hoc `/tmp` paths; Paperclip removes that run-owned directory after the run ends.",
+  "- When `PAPERCLIP_WAKE_PAYLOAD_PATH` is set, read its UTF-8 JSON as this run's full wake payload. Do not modify, move, publish, or log that private run-owned file.",
   "- To ask for that input, create an interaction on the current issue with POST /api/issues/$PAPERCLIP_TASK_ID/interactions using kind suggest_tasks, ask_user_questions, or request_confirmation. Use continuationPolicy wake_assignee when you need to resume after a response (it wakes on acceptance and rejection alike; only expiry does not wake); use wake_assignee_on_accept when you want to resume only after acceptance.",
   "- Never create probe or throwaway issue-thread interactions to discover the interactions API shape or your permissions; schema discovery goes through the OpenAPI spec and explicit validation errors, not placeholder cards. Every ask_user_questions, suggest_tasks, or request_confirmation you post must carry a real, answerable prompt; withdraw one you no longer need instead of leaving it pending.",
   "- When you intentionally restart follow-up work on a completed assigned issue, include structured `resume: true` with the POST /api/issues/$PAPERCLIP_TASK_ID/comments or PATCH /api/issues/$PAPERCLIP_TASK_ID comment payload (substitute that issue's real id when it is not the current task). Generic agent comments on closed issues are inert by default.",
@@ -235,6 +236,7 @@ export const DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE = [
   "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip conversation using the supplied chat mode directive.",
   "Use available tools and assigned skills as needed; respect budget, pause/cancel, approval gates, and company boundaries.",
   "Prefer the smallest verification that proves the action. Use PAPERCLIP_SCRATCH_DIR / PAPERCLIP_RUN_SCRATCH_DIR for temporary scratch files.",
+  "When PAPERCLIP_WAKE_PAYLOAD_PATH is set, read its UTF-8 JSON as this run's full wake payload; do not modify, move, publish, or log that private run-owned file.",
   "After 2 consecutive failures of the same control-plane write, stop retrying that write for the rest of the turn. Report the failure honestly; never claim an unconfirmed mutation succeeded.",
   "Never create probe or throwaway issue-thread interactions. Every interaction must carry a real, answerable prompt; withdraw one you no longer need.",
   "",
@@ -1937,6 +1939,119 @@ export function stringifyPaperclipWakePayload(
     });
   }
   return JSON.stringify(normalized);
+}
+
+/**
+ * Windows limits the entire process environment block to 32,767 UTF-16 code
+ * units. Keep inline wake JSON below 8K so ordinary inherited/runtime entries
+ * retain most of that budget; larger payloads use the run-owned scratch file.
+ */
+export const MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS = 8_192;
+export const PAPERCLIP_WAKE_PAYLOAD_JSON_ENV = "PAPERCLIP_WAKE_PAYLOAD_JSON";
+export const PAPERCLIP_WAKE_PAYLOAD_PATH_ENV = "PAPERCLIP_WAKE_PAYLOAD_PATH";
+export const PAPERCLIP_WAKE_PAYLOAD_ASSET_KEY = "wake-payload";
+const PAPERCLIP_WAKE_PAYLOAD_FILENAME = "payload.json";
+const PAPERCLIP_RUN_SCRATCH_MARKER = ".paperclip-run-scratch.json";
+
+export interface PaperclipWakePayloadTransport {
+  asset: { key: string; localDir: string; followSymlinks: false } | null;
+  /** Changes when a staged remote file must be refreshed rather than reused. */
+  contentHash: string | null;
+  applyToEnv(
+    env: Record<string, string>,
+    options?: { remote?: boolean; remoteAssetDir?: string | null },
+  ): void;
+}
+
+function isOwnedPaperclipRunScratch(
+  value: unknown,
+  expected: { companyId: string; agentId: string; runId: string },
+): value is { type: "heartbeat_run"; dir: string; marker: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const scratch = value as Record<string, unknown>;
+  return scratch.type === "heartbeat_run" &&
+    typeof scratch.dir === "string" && scratch.dir.length > 0 &&
+    scratch.marker === PAPERCLIP_RUN_SCRATCH_MARKER &&
+    expected.companyId.length > 0 && expected.agentId.length > 0 && expected.runId.length > 0;
+}
+
+async function resolveOwnedPaperclipRunScratch(input: {
+  scratch: unknown;
+  companyId: string;
+  agentId: string;
+  runId: string;
+}): Promise<string> {
+  const expected = { companyId: input.companyId, agentId: input.agentId, runId: input.runId };
+  if (!isOwnedPaperclipRunScratch(input.scratch, expected)) {
+    throw new Error("Large Paperclip wake payload requires a server-owned heartbeat scratch directory.");
+  }
+  const dir = path.resolve(input.scratch.dir);
+  const markerPath = path.join(dir, PAPERCLIP_RUN_SCRATCH_MARKER);
+  let marker: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(await fs.readFile(markerPath, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid marker");
+    marker = parsed as Record<string, unknown>;
+  } catch {
+    throw new Error("Large Paperclip wake payload requires a valid server-owned heartbeat scratch directory.");
+  }
+  if (
+    marker.version !== 1 || marker.companyId !== expected.companyId ||
+    marker.agentId !== expected.agentId || marker.runId !== expected.runId
+  ) {
+    throw new Error("Large Paperclip wake payload scratch ownership does not match this run.");
+  }
+  return dir;
+}
+
+/** Writes only oversized serialized wake JSON into the server-created run scratch. */
+export async function preparePaperclipWakePayloadTransport(input: {
+  wake: unknown;
+  scratch: unknown;
+  companyId: string;
+  agentId: string;
+  runId: string;
+}): Promise<PaperclipWakePayloadTransport> {
+  const payload = stringifyPaperclipWakePayload(input.wake);
+  let localPath: string | null = null;
+  let asset: PaperclipWakePayloadTransport["asset"] = null;
+  let contentHash: string | null = null;
+  if (payload && payload.length > MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS) {
+    const scratchDir = await resolveOwnedPaperclipRunScratch(input);
+    const payloadDir = path.join(scratchDir, PAPERCLIP_WAKE_PAYLOAD_ASSET_KEY);
+    await fs.mkdir(payloadDir, { recursive: true, mode: 0o700 });
+    localPath = path.join(payloadDir, PAPERCLIP_WAKE_PAYLOAD_FILENAME);
+    await fs.writeFile(localPath, payload, { encoding: "utf8", mode: 0o600 });
+    await fs.chmod(localPath, 0o600);
+    asset = { key: PAPERCLIP_WAKE_PAYLOAD_ASSET_KEY, localDir: payloadDir, followSymlinks: false };
+    contentHash = createHash("sha256").update(payload, "utf8").digest("hex");
+  }
+  return {
+    asset,
+    contentHash,
+    applyToEnv(env, options = {}) {
+      // The adapter applies this after config refresh, so stale configured or
+      // inherited transport variables cannot reintroduce a large inline copy.
+      delete env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV];
+      delete env[PAPERCLIP_WAKE_PAYLOAD_PATH_ENV];
+      if (!payload) return;
+      if (!localPath) {
+        env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV] = payload;
+        return;
+      }
+      if (options.remote) {
+        if (!options.remoteAssetDir) {
+          throw new Error("Large Paperclip wake payload was not staged for the remote execution target.");
+        }
+        env[PAPERCLIP_WAKE_PAYLOAD_PATH_ENV] = path.posix.join(
+          options.remoteAssetDir,
+          PAPERCLIP_WAKE_PAYLOAD_FILENAME,
+        );
+        return;
+      }
+      env[PAPERCLIP_WAKE_PAYLOAD_PATH_ENV] = localPath;
+    },
+  };
 }
 
 export function isPaperclipRecoveryWakePayload(value: unknown): boolean {

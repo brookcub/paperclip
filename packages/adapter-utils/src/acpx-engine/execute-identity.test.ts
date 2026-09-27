@@ -38,6 +38,7 @@ const SAMPLE_FINGERPRINT_IDENTITY: SessionFingerprintIdentity = {
   mcpServers: [],
   secretManifestHash: "0000",
   adapterEnvHash: "0000",
+  wakePayloadAssetHash: null,
 };
 
 describe("acpx identity split and launch environment", () => {
