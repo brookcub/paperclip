@@ -977,6 +977,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
+    const attemptStartedAt = new Date().toISOString();
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
       env,
@@ -1004,12 +1005,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           source: "claude_config_transcript" as const,
           sessionId: parsedStream.sessionId,
           toolSchemaProjection: "prompt_snapshot_safe_structure.v1" as const,
+          attempt: { startedAt: attemptStartedAt, resumed: Boolean(resumeSessionId) },
+          transcriptTrace: {
+            schema: "paperclip.claude-sanitized-transcript-trace.v1" as const,
+            status: "unavailable" as const,
+            scope: "timestamped_records_at_or_after_attempt_start" as const,
+            ordering: "source_file_then_line" as const,
+            records: [],
+            recordSetSha256: null,
+            parseGaps: ["remote_claude_config_unreadable"],
+          },
           files: [],
           parseGaps: ["remote_claude_config_unreadable"],
         }
       : await captureClaudeTranscriptCompletionEvidence({
           configDir: env.CLAUDE_CONFIG_DIR,
           sessionId: parsedStream.sessionId ?? (asString(parsed?.session_id, "") || null),
+          attemptStartedAt,
+          resumed: Boolean(resumeSessionId),
         });
     return { proc, parsedStream, parsed, completionEvidence };
   };

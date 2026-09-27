@@ -29,7 +29,7 @@ describe("captureClaudeTranscriptCompletionEvidence", () => {
       JSON.stringify({ type: "user", timestamp: "2026-09-27T00:00:03Z", prompt_snapshot: { tools: [{ name: "Read" }, { name: "SubagentHandback" }] } }),
     ].join("\n"));
 
-    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId });
+    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId, attemptStartedAt: "2026-09-26T23:59:59Z", resumed: false });
     expect(evidence.status).toBe("available");
     expect(evidence.files).toHaveLength(2);
     expect(evidence).toMatchObject({
@@ -51,20 +51,31 @@ describe("captureClaudeTranscriptCompletionEvidence", () => {
     });
     expect(JSON.stringify(evidence)).not.toContain("secret");
     expect(JSON.stringify(evidence)).not.toContain("input_schema");
+    expect(evidence.transcriptTrace).toMatchObject({
+      status: "partial",
+      scope: "timestamped_records_at_or_after_attempt_start",
+      ordering: "source_file_then_line",
+    });
+    expect(evidence.transcriptTrace.records.slice(0, 2)).toEqual([
+      expect.objectContaining({ role: "parent", line: 1, recordType: "assistant", timestamp: "2026-09-27T00:00:00Z", model: "claude-opus" }),
+      expect.objectContaining({ role: "parent", line: 2, recordType: "user", timestamp: "2026-09-27T00:00:01Z" }),
+    ]);
+    expect(evidence.transcriptTrace.records[1]?.toolSchemaHashes).toHaveLength(1);
+    expect(evidence.transcriptTrace.recordSetSha256).toMatch(/^[a-f0-9]{64}$/);
   });
 
   it("keeps malformed transcript chunks explicit", async () => {
     const { root, sessionId, project } = await fixture();
     await writeFile(path.join(project, `${sessionId}.jsonl`), "{not json}\n" + JSON.stringify({ type: "assistant", message: { model: "claude-opus" } }));
-    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId });
-    expect(evidence.status).toBe("partial");
+    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId, attemptStartedAt: "2026-09-26T23:59:59Z", resumed: false });
+    expect(evidence.status).toBe("unavailable");
     expect(evidence.parseGaps).toContain("parent_transcript_malformed_records");
     expect(evidence.files[0]?.malformedRecordCount).toBe(1);
   });
 
   it("rejects a session path instead of traversing outside the Claude config", async () => {
     const { root } = await fixture();
-    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId: "../outside" });
+    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId: "../outside", attemptStartedAt: "2026-09-26T23:59:59Z", resumed: false });
     expect(evidence).toMatchObject({ status: "unavailable", files: [], parseGaps: ["invalid_session_id"] });
   });
 
@@ -74,14 +85,49 @@ describe("captureClaudeTranscriptCompletionEvidence", () => {
       path.join(project, `${sessionId}.jsonl`),
       JSON.stringify({ type: "assistant", message: { model: "claude-opus" } }),
     );
-    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId });
+    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId, attemptStartedAt: "2026-09-26T23:59:59Z", resumed: false });
     expect(evidence).toMatchObject({
-      status: "partial",
+      status: "unavailable",
       files: [{ effortStatus: "unavailable", toolSchemaStatus: "unavailable" }],
     });
     expect(evidence.parseGaps).toEqual(expect.arrayContaining([
       "parent_effort_unavailable",
       "parent_tool_schema_unavailable",
     ]));
+  });
+
+  it("excludes earlier resumed-session metadata from this attempt", async () => {
+    const { root, sessionId, project } = await fixture();
+    await writeFile(path.join(project, `${sessionId}.jsonl`), [
+      JSON.stringify({ type: "assistant", timestamp: "2026-09-26T23:59:59Z", effort: "old", message: { model: "claude-old" } }),
+      JSON.stringify({ type: "user", timestamp: "2026-09-27T00:00:01+00:00", prompt_snapshot: { tools: [{ name: "Read", input_schema: { type: "object" } }] } }),
+    ].join("\n"));
+    const evidence = await captureClaudeTranscriptCompletionEvidence({
+      configDir: root,
+      sessionId,
+      attemptStartedAt: "2026-09-27T00:00:00Z",
+      resumed: true,
+    });
+    expect(evidence.attempt).toEqual({ startedAt: "2026-09-27T00:00:00Z", resumed: true });
+    expect(evidence.files[0]).toMatchObject({ models: [], effort: [], effortStatus: "unavailable" });
+    expect(evidence.files[0]?.promptSnapshotTools).toHaveLength(1);
+    expect(evidence.transcriptTrace.records).toEqual([expect.objectContaining({ line: 2, model: null, effort: null })]);
+    expect(evidence.parseGaps).toContain("trace_record_before_attempt_excluded");
+    expect(JSON.stringify(evidence)).not.toContain("claude-old");
+    expect(JSON.stringify(evidence)).not.toContain('"old"');
+  });
+
+  it("marks an attempt without timestamped current records unavailable", async () => {
+    const { root, sessionId, project } = await fixture();
+    await writeFile(path.join(project, `${sessionId}.jsonl`), JSON.stringify({ type: "assistant", message: { model: "claude-opus" } }));
+    const evidence = await captureClaudeTranscriptCompletionEvidence({
+      configDir: root,
+      sessionId,
+      attemptStartedAt: "2026-09-27T00:00:00Z",
+      resumed: true,
+    });
+    expect(evidence).toMatchObject({ status: "unavailable" });
+    expect(evidence.transcriptTrace).toMatchObject({ status: "unavailable", records: [] });
+    expect(evidence.parseGaps).toContain("current_attempt_trace_records_unavailable");
   });
 });

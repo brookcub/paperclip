@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { redactEventPayload } from "../redaction.js";
 import { boundHeartbeatRunEventPayloadForStorage } from "./run-event-payload-bounds.js";
@@ -6,12 +7,44 @@ import {
   persistCompletionEvidenceBeforeScratchCleanup,
 } from "./run-completion-evidence.js";
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+const traceRecords = [{
+  fileName: "agent-child.jsonl",
+  fileSha256: "a".repeat(64),
+  role: "child" as const,
+  line: 2,
+  recordType: "assistant",
+  timestamp: "2026-09-27T00:00:00Z",
+  model: "claude-sonnet",
+  effort: "low",
+  toolSchemaHashes: ["b".repeat(64)],
+}];
 const transcript = {
   schema: "paperclip.claude-transcript-completion-evidence.v1" as const,
   status: "partial" as const,
   source: "claude_config_transcript" as const,
   sessionId: "session-123",
   toolSchemaProjection: "prompt_snapshot_safe_structure.v1" as const,
+  attempt: { startedAt: "2026-09-26T23:59:59Z", resumed: false },
+  transcriptTrace: {
+    schema: "paperclip.claude-sanitized-transcript-trace.v1" as const,
+    status: "partial" as const,
+    scope: "timestamped_records_at_or_after_attempt_start" as const,
+    ordering: "source_file_then_line" as const,
+    records: traceRecords,
+    recordSetSha256: createHash("sha256").update(canonicalJson(traceRecords)).digest("hex"),
+    parseGaps: ["trace_is_transcript_derived"],
+  },
   files: [{
     role: "child" as const,
     fileName: "agent-child.jsonl",
@@ -151,9 +184,41 @@ describe("run completion evidence", () => {
       },
     });
     expect(stored.transcript.files[0].promptSnapshotToolProjections).toHaveLength(1);
+    expect(stored.transcript.transcriptTrace).toMatchObject({
+      status: "partial",
+      scope: "timestamped_records_at_or_after_attempt_start",
+      records: [expect.objectContaining({ fileSha256: "a".repeat(64), line: 2 })],
+      traceLocator: null,
+    });
     expect(JSON.parse(stored.transcript.files[0].promptSnapshotToolProjections[0]))
       .toMatchObject({ name: "Read" });
     expect(JSON.stringify(stored)).not.toContain('"_truncated":true');
+  });
+
+  it("locates the persisted transcript trace by run without inventing an event id", () => {
+    const evidence = buildRunCompletionEvidence({
+      adapterType: "claude_local",
+      adapterResultJson: { completionEvidence: transcript },
+      providerTrace: null,
+      providerTraceRequested: true,
+      runId: "00000000-0000-4000-8000-000000000001",
+    });
+    expect(evidence.transcript).toMatchObject({
+      transcriptTrace: {
+        status: "partial",
+        traceLocator: {
+          kind: "heartbeat_run_event_json_pointer",
+          runId: "00000000-0000-4000-8000-000000000001",
+          eventType: "completion_evidence",
+          jsonPointer: "/transcript/transcriptTrace",
+        },
+      },
+    });
+    expect(JSON.stringify(evidence)).not.toContain("eventId");
+    expect(evidence.providerTrace).toEqual({
+      status: "unavailable",
+      reason: "provider_trace_metadata_unavailable",
+    });
   });
 
   it("keeps storage limits explicit and readable", () => {

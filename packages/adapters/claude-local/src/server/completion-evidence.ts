@@ -13,6 +13,22 @@ type ToolSchemaShape = {
   additionalProperties: boolean | null;
   enumCount: number | null;
 };
+type TranscriptTraceRecord = {
+  fileName: string;
+  fileSha256: string;
+  role: "parent" | "child";
+  line: number;
+  recordType: string | null;
+  timestamp: string;
+  model: string | null;
+  effort: string | null;
+  /** Safe schema identifiers only; tool names and schema bodies stay out of the trace. */
+  toolSchemaHashes: string[];
+};
+type TraceCollector = {
+  records: TranscriptTraceRecord[];
+  addGap: (gap: string) => void;
+};
 
 export type ClaudeTranscriptCompletionEvidence = {
   schema: "paperclip.claude-transcript-completion-evidence.v1";
@@ -21,6 +37,20 @@ export type ClaudeTranscriptCompletionEvidence = {
   sessionId: string | null;
   /** Safe structural projection: never descriptions, defaults, examples, or enum values. */
   toolSchemaProjection: "prompt_snapshot_safe_structure.v1";
+  attempt: {
+    startedAt: string | null;
+    resumed: boolean;
+  };
+  /** Bounded transcript-derived evidence, never a raw provider wire trace. */
+  transcriptTrace: {
+    schema: "paperclip.claude-sanitized-transcript-trace.v1";
+    status: "partial" | "unavailable";
+    scope: "timestamped_records_at_or_after_attempt_start";
+    ordering: "source_file_then_line";
+    records: TranscriptTraceRecord[];
+    recordSetSha256: string | null;
+    parseGaps: string[];
+  };
   files: Array<{
     role: "parent" | "child";
     fileName: string;
@@ -59,6 +89,10 @@ const SCHEMA_TYPES = new Set([
 const MAX_SCHEMA_DEPTH = 8;
 const MAX_SCHEMA_PROPERTIES = 100;
 const MAX_SCHEMA_VARIANTS = 20;
+const MAX_TRACE_RECORDS = 32;
+const MAX_TRACE_SCHEMA_HASHES = 16;
+const VALUE_RE = /^[A-Za-z0-9_.:/@-]{1,200}$/;
+const OFFSET_TIMESTAMP_RE = /(?:Z|[+-]\d{2}:\d{2})$/;
 
 function object(value: unknown): JsonRecord | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -68,6 +102,18 @@ function object(value: unknown): JsonRecord | null {
 
 function string(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function safeValue(value: unknown): string | null {
+  const result = string(value);
+  return result && VALUE_RE.test(result) ? result : null;
+}
+
+function timestamp(value: unknown): string | null {
+  const result = string(value);
+  return result && OFFSET_TIMESTAMP_RE.test(result) && Number.isFinite(Date.parse(result))
+    ? result
+    : null;
 }
 
 function isInside(root: string, candidate: string) {
@@ -174,6 +220,8 @@ function inspectTranscript(
   contents: string,
   role: "parent" | "child",
   fileName: string,
+  attemptStartedAt: number | null,
+  trace: TraceCollector,
 ): ClaudeTranscriptCompletionEvidence["files"][number] {
   const models = new Set<string>();
   const effort = new Set<string>();
@@ -187,7 +235,8 @@ function inspectTranscript(
   }> = [];
   let malformedRecordCount = 0;
 
-  for (const line of contents.split(/\r?\n/)) {
+  const sha256 = createHash("sha256").update(contents).digest("hex");
+  for (const [index, line] of contents.split(/\r?\n/).entries()) {
     if (!line.trim()) continue;
     let record: JsonRecord | null = null;
     try {
@@ -201,18 +250,49 @@ function inspectTranscript(
       continue;
     }
     const message = object(record.message);
-    const model = string(message?.model);
-    if (model) models.add(model);
-    const selectedEffort = string(record.effort);
-    if (selectedEffort) effort.add(selectedEffort);
+    const model = safeValue(message?.model);
+    const selectedEffort = safeValue(record.effort);
     const tools = promptSnapshotToolEntries(record);
-    if (tools) promptSnapshotTools.push({ timestamp: string(record.timestamp), tools });
+    const toolSchemaHashes = (tools ?? [])
+      .map((tool) => tool.inputSchemaShapeSha256)
+      .filter((hash): hash is string => hash !== null);
+    if (!model && !selectedEffort && toolSchemaHashes.length === 0) continue;
+    const recordTimestamp = timestamp(record.timestamp);
+    if (recordTimestamp === null) {
+      trace.addGap("trace_record_timestamp_unavailable");
+      continue;
+    }
+    if (attemptStartedAt === null || Date.parse(recordTimestamp) < attemptStartedAt) {
+      trace.addGap("trace_record_before_attempt_excluded");
+      continue;
+    }
+    if (model) models.add(model);
+    if (selectedEffort) effort.add(selectedEffort);
+    if (tools) promptSnapshotTools.push({ timestamp: recordTimestamp, tools });
+    if (toolSchemaHashes.length > MAX_TRACE_SCHEMA_HASHES) {
+      trace.addGap("trace_schema_hash_projection_truncated");
+    }
+    if (trace.records.length >= MAX_TRACE_RECORDS) {
+      trace.addGap("trace_record_projection_truncated");
+      continue;
+    }
+    trace.records.push({
+      fileName,
+      fileSha256: sha256,
+      role,
+      line: index + 1,
+      recordType: safeValue(record.type),
+      timestamp: recordTimestamp,
+      model,
+      effort: selectedEffort,
+      toolSchemaHashes: toolSchemaHashes.slice(0, MAX_TRACE_SCHEMA_HASHES),
+    });
   }
 
   return {
     role,
     fileName,
-    sha256: createHash("sha256").update(contents).digest("hex"),
+    sha256,
     bytes: Buffer.byteLength(contents),
     models: [...models].sort((left, right) => left.localeCompare(right)),
     effort: [...effort].sort((left, right) => left.localeCompare(right)),
@@ -250,18 +330,33 @@ async function findParentTranscript(
 export async function captureClaudeTranscriptCompletionEvidence(input: {
   configDir: string | null | undefined;
   sessionId: string | null | undefined;
+  attemptStartedAt: string | null | undefined;
+  resumed: boolean;
 }): Promise<ClaudeTranscriptCompletionEvidence> {
   const sessionId = string(input.sessionId);
+  const attemptStartedAt = timestamp(input.attemptStartedAt);
+  const attemptStartedAtMs = attemptStartedAt === null ? null : Date.parse(attemptStartedAt);
   const unavailable = (reason: string): ClaudeTranscriptCompletionEvidence => ({
     schema: "paperclip.claude-transcript-completion-evidence.v1",
     status: "unavailable",
     source: "claude_config_transcript",
     sessionId,
     toolSchemaProjection: "prompt_snapshot_safe_structure.v1",
+    attempt: { startedAt: attemptStartedAt, resumed: input.resumed },
+    transcriptTrace: {
+      schema: "paperclip.claude-sanitized-transcript-trace.v1",
+      status: "unavailable",
+      scope: "timestamped_records_at_or_after_attempt_start",
+      ordering: "source_file_then_line",
+      records: [],
+      recordSetSha256: null,
+      parseGaps: [reason],
+    },
     files: [],
     parseGaps: [reason],
   });
   if (!sessionId || !SESSION_ID_RE.test(sessionId)) return unavailable("invalid_session_id");
+  if (attemptStartedAtMs === null) return unavailable("attempt_start_unavailable");
   const configDir = string(input.configDir);
   if (!configDir) return unavailable("claude_config_dir_unavailable");
   const configRoot = await realpath(configDir).catch(() => null);
@@ -274,9 +369,14 @@ export async function captureClaudeTranscriptCompletionEvidence(input: {
 
   const files: ClaudeTranscriptCompletionEvidence["files"] = [];
   const parseGaps: string[] = [];
+  const traceGaps: string[] = [];
+  const addTraceGap = (gap: string) => {
+    if (traceGaps.length < 16 && !traceGaps.includes(gap)) traceGaps.push(gap);
+  };
+  const trace: TraceCollector = { records: [], addGap: addTraceGap };
   const parentContents = await readFile(parent, "utf8").catch(() => null);
   if (parentContents === null) return unavailable("parent_transcript_unreadable");
-  const parentEvidence = inspectTranscript(parentContents, "parent", path.basename(parent));
+  const parentEvidence = inspectTranscript(parentContents, "parent", path.basename(parent), attemptStartedAtMs, trace);
   files.push(parentEvidence);
   if (parentEvidence.malformedRecordCount > 0) {
     parseGaps.push("parent_transcript_malformed_records");
@@ -306,7 +406,7 @@ export async function captureClaudeTranscriptCompletionEvidence(input: {
       parseGaps.push(`child_transcript_unreadable:${entry.name}`);
       continue;
     }
-    const childEvidence = inspectTranscript(contents, "child", entry.name);
+    const childEvidence = inspectTranscript(contents, "child", entry.name, attemptStartedAtMs, trace);
     files.push(childEvidence);
     if (childEvidence.malformedRecordCount > 0) {
       parseGaps.push(`child_transcript_malformed_records:${entry.name}`);
@@ -319,13 +419,32 @@ export async function captureClaudeTranscriptCompletionEvidence(input: {
     }
   }
 
+  if (trace.records.length === 0) addTraceGap("current_attempt_trace_records_unavailable");
+  const recordSetSha256 = trace.records.length > 0
+    ? createHash("sha256").update(canonicalJson(trace.records)).digest("hex")
+    : null;
+  const traceStatus = trace.records.length > 0 ? "partial" as const : "unavailable" as const;
   return {
     schema: "paperclip.claude-transcript-completion-evidence.v1",
-    status: parseGaps.length > 0 ? "partial" : "available",
+    status: traceStatus === "unavailable"
+      ? "unavailable"
+      : parseGaps.length > 0 || traceGaps.length > 0 ? "partial" : "available",
     source: "claude_config_transcript",
     sessionId,
     toolSchemaProjection: "prompt_snapshot_safe_structure.v1",
+    attempt: { startedAt: attemptStartedAt, resumed: input.resumed },
+    transcriptTrace: {
+      schema: "paperclip.claude-sanitized-transcript-trace.v1",
+      status: traceStatus,
+      scope: "timestamped_records_at_or_after_attempt_start",
+      ordering: "source_file_then_line",
+      records: trace.records,
+      recordSetSha256,
+      parseGaps: traceStatus === "partial"
+        ? ["transcript_derived_not_wire_trace", ...traceGaps]
+        : traceGaps,
+    },
     files,
-    parseGaps,
+    parseGaps: [...parseGaps, ...traceGaps],
   };
 }

@@ -42,7 +42,28 @@ type ClaudeTranscriptCompletionEvidence = {
   source: "claude_config_transcript";
   sessionId: string | null;
   toolSchemaProjection: "prompt_snapshot_safe_structure.v1";
+  attempt: { startedAt: string | null; resumed: boolean };
+  transcriptTrace: ClaudeTranscriptTrace;
   files: TranscriptFile[];
+  parseGaps: string[];
+};
+type ClaudeTranscriptTrace = {
+  schema: "paperclip.claude-sanitized-transcript-trace.v1";
+  status: "partial" | "unavailable";
+  scope: "timestamped_records_at_or_after_attempt_start";
+  ordering: "source_file_then_line";
+  records: Array<{
+    fileName: string;
+    fileSha256: string;
+    role: "parent" | "child";
+    line: number;
+    recordType: string | null;
+    timestamp: string;
+    model: string | null;
+    effort: string | null;
+    toolSchemaHashes: string[];
+  }>;
+  recordSetSha256: string | null;
   parseGaps: string[];
 };
 type DurableTranscriptFile = Omit<TranscriptFile, "promptSnapshotTools"> & {
@@ -51,10 +72,21 @@ type DurableTranscriptFile = Omit<TranscriptFile, "promptSnapshotTools"> & {
 };
 type DurableClaudeTranscriptEvidence = Omit<
   ClaudeTranscriptCompletionEvidence,
-  "files" | "parseGaps"
+  "files" | "parseGaps" | "transcriptTrace"
 > & {
   files: DurableTranscriptFile[];
+  transcriptTrace: DurableClaudeTranscriptTrace;
   parseGaps: string[];
+};
+type DurableClaudeTranscriptTrace = ClaudeTranscriptTrace & {
+  traceLocator: {
+    kind: "heartbeat_run_event_json_pointer";
+    runId: string;
+    eventType: "completion_evidence";
+    jsonPointer: "/transcript/transcriptTrace";
+    traceSchema: "paperclip.claude-sanitized-transcript-trace.v1";
+    recordSetSha256: string;
+  } | null;
 };
 type CodexDynamicTool = {
   name: string;
@@ -105,10 +137,13 @@ const MAX_SCHEMA_VARIANTS = 20;
 const MAX_SCHEMA_NODES = 64;
 const MAX_PROJECTION_CHARS = 12_000;
 const MAX_PROJECTIONS_PER_FILE = 50;
+const MAX_TRACE_RECORDS = 32;
+const MAX_TRACE_SCHEMA_HASHES = 16;
 const ID_RE = /^[A-Za-z0-9-]{1,200}$/;
 const FILE_RE = /^(?:[A-Za-z0-9-]+|agent-[A-Za-z0-9-]+|rollout-[A-Za-z0-9T:-]+-[A-Za-z0-9-]+)\.jsonl$/;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 const VALUE_RE = /^[A-Za-z0-9_.:/@-]{1,200}$/;
+const OFFSET_TIMESTAMP_RE = /(?:Z|[+-]\d{2}:\d{2})$/;
 const TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_.:/-]{0,200}$/;
 const PROPERTY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.:/-]{0,128}$/;
 const SCHEMA_TYPES = new Set([
@@ -288,7 +323,72 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
   };
 }
 
-function transcriptEvidence(value: unknown): DurableClaudeTranscriptEvidence | null {
+function transcriptTrace(value: unknown, runId: string | undefined): DurableClaudeTranscriptTrace | null {
+  const trace = record(value);
+  if (
+    !trace || trace.schema !== "paperclip.claude-sanitized-transcript-trace.v1" ||
+    (trace.status !== "partial" && trace.status !== "unavailable") ||
+    trace.scope !== "timestamped_records_at_or_after_attempt_start" ||
+    trace.ordering !== "source_file_then_line" ||
+    !Array.isArray(trace.records) || trace.records.length > MAX_TRACE_RECORDS ||
+    !Array.isArray(trace.parseGaps)
+  ) return null;
+  const records: ClaudeTranscriptTrace["records"] = trace.records.flatMap((value) => {
+    const item = record(value);
+    if (
+      !item || !FILE_RE.test(String(item.fileName ?? "")) ||
+      !SHA256_RE.test(String(item.fileSha256 ?? "")) ||
+      (item.role !== "parent" && item.role !== "child") ||
+      !Number.isSafeInteger(item.line) || item.line < 1 ||
+      (item.recordType !== null && !VALUE_RE.test(String(item.recordType))) ||
+      offsetTimestamp(item.timestamp) === null ||
+      (item.model !== null && !VALUE_RE.test(String(item.model))) ||
+      (item.effort !== null && !VALUE_RE.test(String(item.effort))) ||
+      !Array.isArray(item.toolSchemaHashes) || item.toolSchemaHashes.length > MAX_TRACE_SCHEMA_HASHES ||
+      item.toolSchemaHashes.some((hash) => typeof hash !== "string" || !SHA256_RE.test(hash))
+    ) return [];
+    return [{
+      fileName: item.fileName as string,
+      fileSha256: (item.fileSha256 as string).toLowerCase(),
+      role: item.role as "parent" | "child",
+      line: item.line as number,
+      recordType: item.recordType === null ? null : item.recordType as string,
+      timestamp: item.timestamp as string,
+      model: item.model === null ? null : item.model as string,
+      effort: item.effort === null ? null : item.effort as string,
+      toolSchemaHashes: (item.toolSchemaHashes as string[]).map((hash) => hash.toLowerCase()),
+    }];
+  });
+  if (records.length !== trace.records.length || (trace.status === "partial" && records.length === 0)) return null;
+  const recordSetSha256 = records.length > 0
+    ? createHash("sha256").update(canonicalJson(records)).digest("hex")
+    : null;
+  if (trace.recordSetSha256 !== recordSetSha256) return null;
+  const parseGaps = trace.parseGaps
+    .filter((gap): gap is string => typeof gap === "string" && VALUE_RE.test(gap))
+    .slice(0, MAX_PARSE_GAPS);
+  return {
+    schema: "paperclip.claude-sanitized-transcript-trace.v1",
+    status: trace.status,
+    scope: "timestamped_records_at_or_after_attempt_start",
+    ordering: "source_file_then_line",
+    records,
+    recordSetSha256,
+    parseGaps,
+    traceLocator: runId && ID_RE.test(runId) && recordSetSha256
+      ? {
+        kind: "heartbeat_run_event_json_pointer",
+        runId,
+        eventType: "completion_evidence",
+        jsonPointer: "/transcript/transcriptTrace",
+        traceSchema: "paperclip.claude-sanitized-transcript-trace.v1",
+        recordSetSha256,
+      }
+      : null,
+  };
+}
+
+function transcriptEvidence(value: unknown, runId: string | undefined): DurableClaudeTranscriptEvidence | null {
   const evidence = record(value);
   if (
     !evidence ||
@@ -298,6 +398,9 @@ function transcriptEvidence(value: unknown): DurableClaudeTranscriptEvidence | n
     !["available", "partial", "unavailable"].includes(String(evidence.status)) ||
     !Array.isArray(evidence.files) ||
     evidence.files.length > MAX_FILES ||
+    !record(evidence.attempt) ||
+    (evidence.attempt.resumed !== true && evidence.attempt.resumed !== false) ||
+    offsetTimestamp(evidence.attempt.startedAt) === null ||
     !Array.isArray(evidence.parseGaps) ||
     !ID_RE.test(String(evidence.sessionId ?? "")) && evidence.sessionId !== null
   ) {
@@ -308,6 +411,8 @@ function transcriptEvidence(value: unknown): DurableClaudeTranscriptEvidence | n
     .map(transcriptFile);
   if (files.some((file) => file === null)) return null;
   const durableFiles = files as DurableTranscriptFile[];
+  const durableTrace = transcriptTrace(evidence.transcriptTrace, runId);
+  if (!durableTrace) return null;
   const parseGaps = [
     ...evidence.parseGaps
       .filter((gap): gap is string => typeof gap === "string" && VALUE_RE.test(gap))
@@ -327,9 +432,17 @@ function transcriptEvidence(value: unknown): DurableClaudeTranscriptEvidence | n
     source: "claude_config_transcript",
     sessionId: typeof evidence.sessionId === "string" ? evidence.sessionId : null,
     toolSchemaProjection: "prompt_snapshot_safe_structure.v1",
+    attempt: { startedAt: evidence.attempt.startedAt as string, resumed: evidence.attempt.resumed as boolean },
+    transcriptTrace: durableTrace,
     files: durableFiles,
     parseGaps,
   };
+}
+
+function offsetTimestamp(value: unknown): string | null {
+  return typeof value === "string" && OFFSET_TIMESTAMP_RE.test(value) && Number.isFinite(Date.parse(value))
+    ? value
+    : null;
 }
 
 function codexDynamicTool(value: unknown): CodexDynamicTool | null {
@@ -455,10 +568,12 @@ export function buildRunCompletionEvidence(input: {
   adapterResultJson: unknown;
   providerTrace: TraceMetadata;
   providerTraceRequested: boolean;
+  /** The caller may supply the terminal run ID; no event ID is fabricated here. */
+  runId?: string;
 }) {
   const adapterResult = record(input.adapterResultJson);
   const transcript = input.adapterType === "claude_local"
-    ? transcriptEvidence(adapterResult?.completionEvidence)
+    ? transcriptEvidence(adapterResult?.completionEvidence, input.runId)
     : input.adapterType === "codex_local"
     ? codexRolloutEvidence(adapterResult?.completionEvidence)
     : null;
@@ -484,6 +599,17 @@ export function buildRunCompletionEvidence(input: {
         source: "claude_config_transcript" as const,
         sessionId: null,
         toolSchemaProjection: "prompt_snapshot_safe_structure.v1" as const,
+        attempt: { startedAt: null, resumed: false },
+        transcriptTrace: {
+          schema: "paperclip.claude-sanitized-transcript-trace.v1" as const,
+          status: "unavailable" as const,
+          scope: "timestamped_records_at_or_after_attempt_start" as const,
+          ordering: "source_file_then_line" as const,
+          records: [],
+          recordSetSha256: null,
+          parseGaps: ["adapter_did_not_report_transcript_evidence"],
+          traceLocator: null,
+        },
         files: [],
         parseGaps: ["adapter_did_not_report_transcript_evidence"],
       },
