@@ -34,6 +34,31 @@ const transcript = {
   parseGaps: ["child_transcript_malformed_records:agent-child.jsonl"],
 };
 
+const codexRollout = {
+  schema: "paperclip.codex-rollout-completion-evidence.v1" as const,
+  status: "partial" as const,
+  source: "codex_rollout_session" as const,
+  sessionId: "019cabcd-1234-7abc-8def-0123456789ab",
+  toolSchemaCoverage: "dynamic_tools_only_partial" as const,
+  rollout: {
+    fileName: "rollout-2026-09-27T00-00-00-019cabcd-1234-7abc-8def-0123456789ab.jsonl",
+    sha256: "b".repeat(64), bytes: 42, models: ["gpt-6-sol"], effort: ["high"],
+    sessionBinding: "session_meta.payload.session_id" as const,
+    fieldProvenance: { model: "turn_context" as const, effort: "turn_context" as const, dynamicTools: "session_meta" as const },
+    effortStatus: "available" as const, dynamicToolSchemaStatus: "available" as const,
+    dynamicTools: [{
+      name: "mcp__company__read_issue",
+      inputSchemaShape: {
+        type: ["object"], required: ["issueId"], properties: ["issueId"], hasItems: false,
+        variants: [], additionalProperties: false, enumCount: null,
+      },
+      inputSchemaShapeSha256: "a".repeat(64),
+    }],
+    malformedRecordCount: 0,
+  },
+  parseGaps: ["builtin_tool_schema_not_in_rollout_dynamic_tools"],
+};
+
 describe("run completion evidence", () => {
   it("keeps the terminal failure record readable after cleanup", async () => {
     const evidence = buildRunCompletionEvidence({
@@ -271,17 +296,23 @@ describe("run completion evidence", () => {
     });
   });
 
-  it("does not claim a Claude transcript for another adapter", () => {
+  it("keeps Codex dynamic-tool evidence explicitly partial and omits trace invention", () => {
     const evidence = buildRunCompletionEvidence({
       adapterType: "codex_local",
-      adapterResultJson: { completionEvidence: transcript },
+      adapterResultJson: { completionEvidence: codexRollout },
       providerTrace: null,
       providerTraceRequested: false,
     });
-    expect(evidence.transcript).toEqual({
-      status: "not_applicable",
-      reason: "adapter_not_claude_local",
+    expect(evidence).toMatchObject({
+      transcript: {
+        schema: "paperclip.codex-rollout-completion-evidence.v1",
+        status: "partial",
+        toolSchemaCoverage: "dynamic_tools_only_partial",
+        parseGaps: ["builtin_tool_schema_not_in_rollout_dynamic_tools"],
+      },
+      providerTrace: { status: "unavailable", reason: "provider_trace_not_requested" },
     });
+    expect(JSON.stringify(evidence)).not.toContain("a".repeat(64));
   });
 
   it("marks incomplete or expired trace metadata without a usable pointer", () => {

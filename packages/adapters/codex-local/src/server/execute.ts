@@ -91,6 +91,7 @@ import {
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
+import { captureCodexRolloutCompletionEvidence } from "./completion-evidence.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS,
@@ -1391,7 +1392,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     };
 
-    const toResult = (
+    const toResult = async (
       attempt: {
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
@@ -1402,7 +1403,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
       clearSessionOnMissingSession = false,
       isRetry = false,
-    ): AdapterExecutionResult => {
+    ): Promise<AdapterExecutionResult> => {
       if (attempt.monitor?.fired) {
         const errorMessage = formatOutputInactivityMonitorErrorMessage(attempt.monitor.elapsedMsSinceLastEvent);
         return {
@@ -1516,6 +1517,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         authRefreshFailure ??
         (providerQuota ? "provider_quota" : transientUpstream || harnessCrash ? "transient_upstream" : null);
 
+      const completionEvidence = await captureCodexRolloutCompletionEvidence({
+        // The remote home is a staged copy and is deliberately removed after execution;
+        // do not read it or represent host-side sessions as remote-run evidence.
+        codexHome: executionTargetIsRemote ? null : effectiveCodexHome,
+        sessionId: resolvedSessionId,
+        ...(executionTargetIsRemote ? { unavailableReason: "remote_codex_rollout_unavailable" } : {}),
+      });
       return {
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
@@ -1554,6 +1562,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
+          completionEvidence,
           ...(errorFamily ? { errorFamily } : {}),
           ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
@@ -1582,14 +1591,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
         const retry = await runAttempt(null);
-        const retryResult = toResult(retry, true, true);
+        const retryResult = await toResult(retry, true, true);
         if (retryResult.errorMessage) {
           executionError = new Error(retryResult.errorMessage);
         }
         return retryResult;
       }
 
-      const result = toResult(initial, false, false);
+      const result = await toResult(initial, false, false);
       if (result.errorMessage) {
         executionError = new Error(result.errorMessage);
       }

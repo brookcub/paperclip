@@ -56,6 +56,40 @@ type DurableClaudeTranscriptEvidence = Omit<
   files: DurableTranscriptFile[];
   parseGaps: string[];
 };
+type CodexDynamicTool = {
+  name: string;
+  inputSchemaShape: {
+    type: string[];
+    required: string[];
+    properties: string[];
+    hasItems: boolean;
+    variants: string[];
+    additionalProperties: boolean | null;
+    enumCount: number | null;
+  } | null;
+  inputSchemaShapeSha256: string | null;
+};
+type DurableCodexRolloutEvidence = {
+  schema: "paperclip.codex-rollout-completion-evidence.v1";
+  status: "partial" | "unavailable";
+  source: "codex_rollout_session";
+  sessionId: string | null;
+  toolSchemaCoverage: "dynamic_tools_only_partial";
+  rollout: null | {
+    fileName: string;
+    sha256: string;
+    bytes: number;
+    sessionBinding: "session_meta.payload.session_id";
+    fieldProvenance: { model: "turn_context"; effort: "turn_context"; dynamicTools: "session_meta" };
+    models: string[];
+    effort: string[];
+    effortStatus: EvidenceAvailability;
+    dynamicToolSchemaStatus: EvidenceAvailability;
+    dynamicTools: CodexDynamicTool[];
+    malformedRecordCount: number;
+  };
+  parseGaps: string[];
+};
 
 const MAX_FILES = 64;
 const MAX_DURABLE_FILES = 50;
@@ -72,7 +106,7 @@ const MAX_SCHEMA_NODES = 64;
 const MAX_PROJECTION_CHARS = 12_000;
 const MAX_PROJECTIONS_PER_FILE = 50;
 const ID_RE = /^[A-Za-z0-9-]{1,200}$/;
-const FILE_RE = /^(?:[A-Za-z0-9-]+|agent-[A-Za-z0-9-]+)\.jsonl$/;
+const FILE_RE = /^(?:[A-Za-z0-9-]+|agent-[A-Za-z0-9-]+|rollout-[A-Za-z0-9T:-]+-[A-Za-z0-9-]+)\.jsonl$/;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
 const VALUE_RE = /^[A-Za-z0-9_.:/@-]{1,200}$/;
 const TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_.:/-]{0,200}$/;
@@ -298,6 +332,84 @@ function transcriptEvidence(value: unknown): DurableClaudeTranscriptEvidence | n
   };
 }
 
+function codexDynamicTool(value: unknown): CodexDynamicTool | null {
+  const tool = record(value);
+  if (!tool || typeof tool.name !== "string" || !TOOL_NAME_RE.test(tool.name)) return null;
+  if (tool.inputSchemaShape === null && tool.inputSchemaShapeSha256 === null) {
+    return { name: tool.name, inputSchemaShape: null, inputSchemaShapeSha256: null };
+  }
+  const shape = record(tool.inputSchemaShape);
+  if (!shape || typeof tool.inputSchemaShapeSha256 !== "string" || !SHA256_RE.test(tool.inputSchemaShapeSha256)) return null;
+  const type = safeValues(shape.type, 8).filter((entry) => SCHEMA_TYPES.has(entry));
+  const required = safeValues(shape.required, MAX_SCHEMA_PROPERTIES)
+    .filter((entry) => PROPERTY_NAME_RE.test(entry));
+  const properties = safeValues(shape.properties, MAX_SCHEMA_PROPERTIES)
+    .filter((entry) => PROPERTY_NAME_RE.test(entry));
+  const variants = safeValues(shape.variants, MAX_SCHEMA_VARIANTS)
+    .filter((entry) => ["oneOf", "anyOf", "allOf"].includes(entry));
+  const enumCount = typeof shape.enumCount === "number" && Number.isSafeInteger(shape.enumCount) && shape.enumCount >= 0
+    ? Math.min(shape.enumCount, MAX_SCHEMA_PROPERTIES)
+    : null;
+  if (typeof shape.hasItems !== "boolean") return null;
+  if (shape.additionalProperties !== null && typeof shape.additionalProperties !== "boolean") return null;
+  const inputSchemaShape = {
+    type, required, properties, hasItems: shape.hasItems, variants,
+    additionalProperties: shape.additionalProperties, enumCount,
+  };
+  return {
+    name: tool.name,
+    inputSchemaShape,
+    inputSchemaShapeSha256: createHash("sha256").update(canonicalJson(inputSchemaShape)).digest("hex"),
+  };
+}
+
+function codexRolloutEvidence(value: unknown): DurableCodexRolloutEvidence | null {
+  const evidence = record(value);
+  if (
+    !evidence || evidence.schema !== "paperclip.codex-rollout-completion-evidence.v1" ||
+    evidence.source !== "codex_rollout_session" || evidence.toolSchemaCoverage !== "dynamic_tools_only_partial" ||
+    !["partial", "unavailable"].includes(String(evidence.status)) ||
+    (!ID_RE.test(String(evidence.sessionId ?? "")) && evidence.sessionId !== null) ||
+    !Array.isArray(evidence.parseGaps)
+  ) return null;
+  if (evidence.rollout === null) {
+    return {
+      schema: "paperclip.codex-rollout-completion-evidence.v1", status: "unavailable", source: "codex_rollout_session",
+      sessionId: evidence.sessionId, toolSchemaCoverage: "dynamic_tools_only_partial", rollout: null,
+      parseGaps: evidence.parseGaps.filter((gap): gap is string => typeof gap === "string" && VALUE_RE.test(gap)).slice(0, MAX_PARSE_GAPS),
+    };
+  }
+  const rollout = record(evidence.rollout);
+  const fieldProvenance = rollout ? record(rollout.fieldProvenance) : null;
+  if (
+    !rollout || typeof rollout.fileName !== "string" || !FILE_RE.test(rollout.fileName) ||
+    typeof rollout.sha256 !== "string" || !SHA256_RE.test(rollout.sha256) ||
+    typeof rollout.bytes !== "number" || !Number.isSafeInteger(rollout.bytes) || rollout.bytes < 0 ||
+    rollout.sessionBinding !== "session_meta.payload.session_id" ||
+    !fieldProvenance || fieldProvenance.model !== "turn_context" ||
+    fieldProvenance.effort !== "turn_context" || fieldProvenance.dynamicTools !== "session_meta" ||
+    (rollout.effortStatus !== "available" && rollout.effortStatus !== "unavailable") ||
+    (rollout.dynamicToolSchemaStatus !== "available" && rollout.dynamicToolSchemaStatus !== "unavailable") ||
+    !Array.isArray(rollout.dynamicTools) || rollout.dynamicTools.length > MAX_TOOLS_PER_SNAPSHOT ||
+    typeof rollout.malformedRecordCount !== "number" || !Number.isSafeInteger(rollout.malformedRecordCount) || rollout.malformedRecordCount < 0
+  ) return null;
+  const dynamicTools = rollout.dynamicTools.map(codexDynamicTool);
+  if (dynamicTools.some((tool) => tool === null)) return null;
+  return {
+    schema: "paperclip.codex-rollout-completion-evidence.v1", status: "partial", source: "codex_rollout_session",
+    sessionId: evidence.sessionId, toolSchemaCoverage: "dynamic_tools_only_partial",
+    rollout: {
+      fileName: rollout.fileName, sha256: rollout.sha256.toLowerCase(), bytes: rollout.bytes,
+      sessionBinding: "session_meta.payload.session_id",
+      fieldProvenance: { model: "turn_context", effort: "turn_context", dynamicTools: "session_meta" },
+      models: safeValues(rollout.models, MAX_MODELS_PER_FILE), effort: safeValues(rollout.effort, MAX_EFFORTS_PER_FILE),
+      effortStatus: rollout.effortStatus, dynamicToolSchemaStatus: rollout.dynamicToolSchemaStatus,
+      dynamicTools: dynamicTools as CodexDynamicTool[], malformedRecordCount: rollout.malformedRecordCount,
+    },
+    parseGaps: evidence.parseGaps.filter((gap): gap is string => typeof gap === "string" && VALUE_RE.test(gap)).slice(0, MAX_PARSE_GAPS),
+  };
+}
+
 function traceEvidence(trace: TraceMetadata, requested: boolean) {
   if (!trace) {
     return {
@@ -340,13 +452,25 @@ export function buildRunCompletionEvidence(input: {
   const adapterResult = record(input.adapterResultJson);
   const transcript = input.adapterType === "claude_local"
     ? transcriptEvidence(adapterResult?.completionEvidence)
+    : input.adapterType === "codex_local"
+    ? codexRolloutEvidence(adapterResult?.completionEvidence)
     : null;
   return {
     schema: "paperclip.run-completion-evidence.v1",
     transcript: input.adapterType === null
       ? { status: "unavailable" as const, reason: "adapter_type_unavailable" }
-      : input.adapterType !== "claude_local"
-      ? { status: "not_applicable" as const, reason: "adapter_not_claude_local" }
+      : input.adapterType !== "claude_local" && input.adapterType !== "codex_local"
+      ? { status: "not_applicable" as const, reason: "adapter_does_not_report_completion_evidence" }
+      : input.adapterType === "codex_local"
+      ? transcript ?? {
+        schema: "paperclip.codex-rollout-completion-evidence.v1" as const,
+        status: "unavailable" as const,
+        source: "codex_rollout_session" as const,
+        sessionId: null,
+        toolSchemaCoverage: "dynamic_tools_only_partial" as const,
+        rollout: null,
+        parseGaps: ["adapter_did_not_report_rollout_evidence"],
+      }
       : transcript ?? {
         schema: "paperclip.claude-transcript-completion-evidence.v1",
         status: "unavailable" as const,
