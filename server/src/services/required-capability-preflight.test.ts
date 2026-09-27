@@ -33,7 +33,11 @@ describe("required capability preflight", () => {
 
   it("admits local Claude auto policy while preserving its conditional status", () => {
     const result = evaluateRequiredCapabilities({ requirements, agentId: "agent-1", adapterType: "claude_local", adapterConfig: { dangerouslySkipPermissions: false }, targetIsRemote: false, selectedSkillKeys: ["ponytail-skill"], skillSelectionsVerified: true, agentPermissionKeys: ["agents:suggest-changes"], managedMcpToolNames: [] });
-    expect(result).toMatchObject({ admitted: true, admittedPolicy: [{ id: "tool:claude_cli:Bash", authorization: "conditional" }] });
+    expect(result).toMatchObject({
+      admitted: true,
+      admittedCatalog: ["skill:ponytail-skill", "tool:claude_cli:Bash", "permission:agents:suggest-changes"],
+      admittedPolicy: [{ id: "tool:claude_cli:Bash", authorization: "conditional" }],
+    });
   });
 
   it("reports every missing requirement and does not use a human grant", () => {
@@ -42,6 +46,7 @@ describe("required capability preflight", () => {
       expect.objectContaining({ id: "skill:ponytail-skill", state: "missing" }),
       expect.objectContaining({ id: "permission:agents:suggest-changes", state: "missing" }),
     ]));
+    expect(result.admittedCatalog).toEqual([]);
   });
 
   it("labels an unavailable selected skill source without implying a required pin", () => {
@@ -52,6 +57,7 @@ describe("required capability preflight", () => {
       agentPermissionKeys: [], managedMcpToolNames: [],
     });
     expect(result.unmet).toContainEqual(expect.objectContaining({ reason: "skill_source_unavailable" }));
+    expect(result.admittedCatalog).toEqual([]);
   });
 
   it("refuses CLI tool admission when the resolved target is unknown or remote Codex", () => {

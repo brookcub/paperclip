@@ -249,9 +249,30 @@ describeEmbedded("heartbeat required capability admission", () => {
     expect(run).toMatchObject({ status: "cancelled", startedAt: null, errorCode: "required_capabilities_unavailable" });
     expect(run?.runnerProfileJson ?? {}).not.toHaveProperty("capabilityPreflight");
     expect(run?.resultJson).toMatchObject({
-      requiredCapabilities: { admitted: false },
+      requiredCapabilities: { admitted: false, admittedCatalog: [] },
     });
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("does not list missing skills or agent grants as admitted", async () => {
+    const { companyId, agentId, issueId } = await seed({ requiredCapabilities: { version: 1, items: [
+      { kind: "skill", key: "company/missing-skill" },
+      { kind: "permission", key: "agents:suggest-changes" },
+    ] } });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+    await heartbeat.drainActiveRunExecutions();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(run?.resultJson).toMatchObject({
+      requiredCapabilities: {
+        admitted: false,
+        admittedCatalog: [],
+        unmet: expect.arrayContaining([
+          expect.objectContaining({ id: "skill:company/missing-skill", state: "missing" }),
+          expect.objectContaining({ id: "permission:agents:suggest-changes", state: "missing" }),
+        ]),
+      },
+    });
   });
 
   it("tracks a deferred wake promoted by lock-owned capability cancellation", async () => {
@@ -422,6 +443,7 @@ describeEmbedded("heartbeat required capability admission", () => {
         agentId,
         admitted: true,
         requirements: [{ kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" }],
+        admittedCatalog: ["tool:codex_cli:shell"],
         admittedPolicy: [{ id: "tool:codex_cli:shell", authorization: "conditional" }],
         unmet: [],
         decidedAt: expect.any(String),
@@ -431,6 +453,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     expect(new Date(receipt.decidedAt as string)).toEqual(stored?.startedAt);
     expect(Object.keys(receipt).sort()).toEqual([
       "admitted",
+      "admittedCatalog",
       "admittedPolicy",
       "agentId",
       "decidedAt",
@@ -476,6 +499,15 @@ describeEmbedded("heartbeat required capability admission", () => {
       const heartbeat = heartbeatService(db);
       const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
       await expectExecuted(heartbeat, run);
+      expect((await heartbeat.getRun(run!.id))?.runnerProfileJson).toMatchObject({
+        capabilityPreflight: {
+          admittedCatalog: [
+            `skill:${key}`,
+            "permission:agents:suggest-changes",
+            "tool:codex_cli:shell",
+          ],
+        },
+      });
     } finally {
       await fs.rm(source, { recursive: true, force: true });
     }

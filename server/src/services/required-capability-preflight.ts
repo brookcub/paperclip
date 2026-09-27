@@ -12,6 +12,7 @@ export type CapabilityPreflightResult = {
   admitted: boolean;
   requirements: Requirement[];
   unmet: Array<{ id: string; state: "missing" | "unknown"; reason: string }>;
+  admittedCatalog: string[];
   admittedPolicy: Array<{ id: string; authorization: "unprompted" | "conditional" }>;
 };
 
@@ -124,6 +125,7 @@ export function evaluateRequiredCapabilities(input: {
   const permissions = new Set(input.agentPermissionKeys);
   const mcp = new Set(input.managedMcpToolNames);
   const unmet: CapabilityPreflightResult["unmet"] = [];
+  const admittedCatalog: CapabilityPreflightResult["admittedCatalog"] = [];
   const admittedPolicy: CapabilityPreflightResult["admittedPolicy"] = [];
   const applicable = input.requirements.filter((requirement) =>
     requirement.kind === "invalid" || !requirement.when || requirement.when.agentId === input.agentId,
@@ -142,17 +144,22 @@ export function evaluateRequiredCapabilities(input: {
         unmet.push({ id, state: "unknown", reason: "skill_source_unavailable" });
       } else if (!skills.has(requirement.key)) unmet.push({ id, state: "missing", reason: "skill_not_selected" });
       else if (!input.skillSelectionsVerified) unmet.push({ id, state: "unknown", reason: "skill_revision_not_rechecked" });
+      else admittedCatalog.push(id);
       continue;
     }
     if (requirement.kind === "permission") {
       if (!permissions.has(requirement.key)) unmet.push({ id, state: "missing", reason: "agent_grant_missing" });
+      else admittedCatalog.push(id);
       continue;
     }
     if (requirement.runtime === "paperclip_mcp") {
       if (!mcp.has(requirement.name)) unmet.push({ id, state: "missing", reason: "managed_mcp_tool_not_granted" });
       else if (requirement.authorization === "must_not_prompt") {
         unmet.push({ id, state: "missing", reason: "unprompted_authorization_required" });
-      } else admittedPolicy.push({ id, authorization: "conditional" });
+      } else {
+        admittedCatalog.push(id);
+        admittedPolicy.push({ id, authorization: "conditional" });
+      }
       continue;
     }
     if (input.targetIsRemote === null) {
@@ -177,8 +184,9 @@ export function evaluateRequiredCapabilities(input: {
     } else if (requirement.authorization === "must_not_prompt" && policy.authorization !== "unprompted") {
       unmet.push({ id, state: "missing", reason: "unprompted_authorization_required" });
     } else {
+      admittedCatalog.push(id);
       admittedPolicy.push({ id, authorization: policy.authorization });
     }
   }
-  return { admitted: unmet.length === 0, requirements: input.requirements, unmet, admittedPolicy };
+  return { admitted: unmet.length === 0, requirements: input.requirements, unmet, admittedCatalog, admittedPolicy };
 }

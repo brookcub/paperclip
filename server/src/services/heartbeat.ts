@@ -17178,14 +17178,14 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     if (!issue) {
       return {
-        result: { admitted: false, requirements: [], unmet: [{ id: `issue:${issueId}`, state: "missing" as const, reason: "issue_missing" }], admittedPolicy: [] },
+        result: { admitted: false, requirements: [], unmet: [{ id: `issue:${issueId}`, state: "missing" as const, reason: "issue_missing" }], admittedCatalog: [], admittedPolicy: [] },
         snapshot: { issueId, agentId: agent.id, issueUpdatedAt: "missing", executionPolicy: "null", agentUpdatedAt: agent.updatedAt.toISOString(), adapterType: agent.adapterType, adapterConfig: stableCapabilitySnapshot(agent.adapterConfig), permissionKeys: [], allowedAgentPermissionKeys: [], managedMcpRevision: "", executionTargetRevision: "", skillRevisions: [], skillVersionPinsEnabled: false },
       };
     }
     const requirements = readRequiredCapabilities(issue?.executionPolicy);
     if (requirements.length === 0) {
       return {
-        result: { admitted: true, requirements, unmet: [], admittedPolicy: [] },
+        result: { admitted: true, requirements, unmet: [], admittedCatalog: [], admittedPolicy: [] },
         snapshot: {
           issueId,
           agentId: agent.id,
@@ -17255,6 +17255,7 @@ export function heartbeatService(
             state: "unknown" as const,
             reason: "effective_dispatch_config_requires_resolution",
           })),
+          admittedCatalog: [],
           admittedPolicy: [],
         },
         snapshot,
@@ -17345,6 +17346,7 @@ export function heartbeatService(
         decidedAt: input.decidedAt.toISOString(),
         admitted: true,
         requirements: input.preflight.result.requirements,
+        admittedCatalog: input.preflight.result.admittedCatalog,
         admittedPolicy: input.preflight.result.admittedPolicy,
         unmet: [],
       },
