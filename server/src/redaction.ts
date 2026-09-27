@@ -31,6 +31,13 @@ const AUDIT_COUNT_PAYLOAD_KEYS = new Set([
   "cacheWriteTokens",
   "preTokens",
   "postTokens",
+  // Claude and Codex emit these exact snake_case usage counters in their
+  // streamed provider frames. Keep the exemption to finite numbers only.
+  "input_tokens",
+  "output_tokens",
+  "cache_creation_input_tokens",
+  "cache_read_input_tokens",
+  "cached_input_tokens",
 ]);
 
 function isAuditCountField(key: string, value: unknown): boolean {

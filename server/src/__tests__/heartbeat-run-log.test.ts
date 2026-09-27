@@ -100,6 +100,50 @@ describe("createRunLogChunkNormalizer", () => {
     ]);
   });
 
+  it("preserves finite Claude and Codex usage counters while redacting nonnumeric token fields", () => {
+    const normalizer = createRunLogChunkNormalizer({ currentUserRedactionOptions });
+    const claude = {
+      type: "result",
+      usage: {
+        input_tokens: 101,
+        output_tokens: 202,
+        cache_creation_input_tokens: 303,
+        cache_read_input_tokens: 404,
+      },
+    };
+    const codex = {
+      type: "turn.completed",
+      usage: {
+        input_tokens: 505,
+        output_tokens: 606,
+        cached_input_tokens: 707,
+      },
+    };
+    const malformedUsage = {
+      type: "result",
+      usage: {
+        input_tokens: "not-a-count",
+        cache_read_input_tokens: { value: "not-a-count" },
+        access_token: "must-not-survive",
+      },
+    };
+
+    const output = normalizer
+      .push(
+        "stdout",
+        [claude, codex, malformedUsage].map((frame) => JSON.stringify(frame)).join("\n") + "\n",
+      )
+      .map((chunk) => JSON.parse(chunk) as Record<string, unknown>);
+
+    expect(output[0]?.usage).toEqual(claude.usage);
+    expect(output[1]?.usage).toEqual(codex.usage);
+    expect(output[2]?.usage).toEqual({
+      input_tokens: "***REDACTED***",
+      cache_read_input_tokens: "***REDACTED***",
+      access_token: "***REDACTED***",
+    });
+  });
+
   it("drops an oversized unterminated line through its newline before resuming", () => {
     const secret = "oversized-line-secret";
     const normalizer = createRunLogChunkNormalizer({

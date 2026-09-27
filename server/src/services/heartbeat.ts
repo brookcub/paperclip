@@ -22435,6 +22435,21 @@ export function heartbeatService(
           currentUserRedactionOptions,
         });
         let onLogChain = Promise.resolve();
+        let firstRunLogError: unknown;
+        let hasRunLogError = false;
+        const enqueueRunLogTask = (task: () => Promise<void>) => {
+          const pending = onLogChain.then(async () => {
+            if (hasRunLogError) throw firstRunLogError;
+            await task();
+          });
+          onLogChain = pending.catch((error) => {
+            if (!hasRunLogError) {
+              firstRunLogError = error;
+              hasRunLogError = true;
+            }
+          });
+          return pending;
+        };
         const touchLogActivity = (ts: string) => {
           // Streamed CLI output is real run activity even while a partial
           // provider frame is buffered for complete-line redaction.
@@ -22511,23 +22526,19 @@ export function heartbeatService(
         const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
           const ts = new Date().toISOString();
           touchLogActivity(ts);
-          const pending = onLogChain.then(async () => {
+          await enqueueRunLogTask(async () => {
             for (const sanitizedChunk of runLogChunkNormalizer.push(stream, chunk)) {
               await persistLogChunk(stream, sanitizedChunk, ts);
             }
           });
-          onLogChain = pending.catch(() => undefined);
-          await pending;
         };
         flushRunLogChunks = async () => {
-          const pending = onLogChain.then(async () => {
+          await enqueueRunLogTask(async () => {
             const ts = new Date().toISOString();
             for (const { stream, chunk } of runLogChunkNormalizer.flush()) {
               await persistLogChunk(stream, chunk, ts);
             }
           });
-          onLogChain = pending.catch(() => undefined);
-          await pending;
         };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
