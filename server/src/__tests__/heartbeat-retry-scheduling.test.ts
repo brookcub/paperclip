@@ -13,6 +13,7 @@ import {
   companies,
   companySkills,
   createDb,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   environmentLeases,
   executionWorkspaces,
   heartbeatRunEvents,
@@ -124,7 +125,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
-  }, 20_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     // Await every in-flight background heartbeat run to quiescence before the
