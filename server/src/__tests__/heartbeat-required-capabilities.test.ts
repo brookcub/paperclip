@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -278,14 +278,22 @@ describeEmbedded("heartbeat required capability admission", () => {
     const { companyId, agentId, issueId } = await seed({
       requiredCapabilities: { version: 1, items: [{ kind: "skill", key: PAPERCLIP_OPERATIONAL_SKILL_KEY }] },
     });
+    const beforeWake = await db
+      .select({ key: companySkills.key })
+      .from(companySkills)
+      .where(and(
+        eq(companySkills.companyId, companyId),
+        eq(companySkills.key, PAPERCLIP_OPERATIONAL_SKILL_KEY),
+      ));
+    expect(beforeWake).toEqual([]);
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+    await expectExecuted(heartbeat, run, 30_000);
     const selected = await companySkillService(db).listRuntimeSkillEntries(companyId);
     expect(selected).toContainEqual(expect.objectContaining({
       key: PAPERCLIP_OPERATIONAL_SKILL_KEY,
       sourceStatus: "available",
     }));
-    const heartbeat = heartbeatService(db);
-    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
-    await expectExecuted(heartbeat, run, 30_000);
   }, 45_000);
 
   it("refuses a Codex CLI capability on a selected remote target", async () => {
