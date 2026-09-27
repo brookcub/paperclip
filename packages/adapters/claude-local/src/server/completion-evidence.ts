@@ -174,7 +174,7 @@ function inspectTranscript(
   contents: string,
   role: "parent" | "child",
   fileName: string,
-) {
+): ClaudeTranscriptCompletionEvidence["files"][number] {
   const models = new Set<string>();
   const effort = new Set<string>();
   const promptSnapshotTools: Array<{

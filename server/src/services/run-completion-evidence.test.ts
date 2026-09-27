@@ -170,6 +170,33 @@ describe("run completion evidence", () => {
     expect(JSON.stringify(stored)).not.toContain('"_truncated":true');
   });
 
+  it("marks excess transcript files partial before the event array bound drops them", () => {
+    const evidence = buildRunCompletionEvidence({
+      adapterType: "claude_local",
+      adapterResultJson: {
+        completionEvidence: {
+          ...transcript,
+          status: "available",
+          files: Array.from({ length: 51 }, (_, index) => ({
+            ...transcript.files[0],
+            fileName: `agent-${index}.jsonl`,
+          })),
+        },
+      },
+      providerTrace: null,
+      providerTraceRequested: false,
+    });
+    const stored = JSON.parse(JSON.stringify(redactEventPayload(
+      boundHeartbeatRunEventPayloadForStorage(evidence),
+    )));
+    expect(stored.transcript).toMatchObject({ status: "partial" });
+    expect(stored.transcript.files).toHaveLength(50);
+    expect(stored.transcript.parseGaps).toContain(
+      "transcript_file_projection_truncated",
+    );
+    expect(JSON.stringify(stored)).not.toContain('"_truncated":true');
+  });
+
   it("rehashes the final safe schema shape rather than retaining a stale source hash", () => {
     const evidence = buildRunCompletionEvidence({
       adapterType: "claude_local",
@@ -199,6 +226,41 @@ describe("run completion evidence", () => {
     const projection = JSON.parse(evidence.transcript.files[0].promptSnapshotToolProjections[0]);
     expect(projection.inputSchemaShapeSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(projection.inputSchemaShapeSha256).not.toBe("a".repeat(64));
+  });
+
+  it("marks a depth-capped safe schema projection partial", () => {
+    let deepShape: Record<string, unknown> = {
+      type: ["string"], required: [], properties: {}, items: null,
+      variants: [], additionalProperties: null, enumCount: null,
+    };
+    for (let index = 0; index < 10; index += 1) {
+      deepShape = {
+        type: ["object"], required: ["next"], properties: { next: deepShape },
+        items: null, variants: [], additionalProperties: null, enumCount: null,
+      };
+    }
+    const evidence = buildRunCompletionEvidence({
+      adapterType: "claude_local",
+      adapterResultJson: {
+        completionEvidence: {
+          ...transcript,
+          status: "available",
+          files: [{
+            ...transcript.files[0],
+            promptSnapshotTools: [{ timestamp: null, tools: [{
+              name: "Read", inputSchemaShape: deepShape,
+              inputSchemaShapeSha256: "a".repeat(64),
+            }] }],
+          }],
+        },
+      },
+      providerTrace: null,
+      providerTraceRequested: false,
+    });
+    expect(evidence.transcript).toMatchObject({
+      status: "partial",
+      files: [{ toolSchemaProjectionStatus: "partial" }],
+    });
   });
 
   it("does not claim a Claude transcript for another adapter", () => {

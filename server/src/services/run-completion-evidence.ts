@@ -58,6 +58,7 @@ type DurableClaudeTranscriptEvidence = Omit<
 };
 
 const MAX_FILES = 64;
+const MAX_DURABLE_FILES = 50;
 const MAX_MODELS_PER_FILE = 32;
 const MAX_EFFORTS_PER_FILE = 16;
 const MAX_SNAPSHOTS_PER_FILE = 128;
@@ -115,10 +116,12 @@ function canonicalJson(value: unknown): string {
 function safeShape(
   value: unknown,
   depth = 0,
-  budget: { nodes: number } = { nodes: 0 },
+  budget: { nodes: number; truncated: boolean } = { nodes: 0, truncated: false },
 ): ToolSchemaShape | null {
   const shape = record(value);
-  if (!shape || depth > MAX_SCHEMA_DEPTH || ++budget.nodes > MAX_SCHEMA_NODES) {
+  if (!shape) return null;
+  if (depth > MAX_SCHEMA_DEPTH || ++budget.nodes > MAX_SCHEMA_NODES) {
+    budget.truncated = true;
     return null;
   }
   const properties = record(shape.properties);
@@ -194,9 +197,11 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
         if (!item || typeof item.name !== "string" || !TOOL_NAME_RE.test(item.name)) {
           return [];
         }
+        const shapeBudget = { nodes: 0, truncated: false };
         const inputSchemaShape = item.inputSchemaShape === null
           ? null
-          : safeShape(item.inputSchemaShape);
+          : safeShape(item.inputSchemaShape, 0, shapeBudget);
+        if (shapeBudget.truncated) toolSchemaProjectionStatus = "partial";
         const inputSchemaShapeSha256 = typeof item.inputSchemaShapeSha256 === "string" &&
           SHA256_RE.test(item.inputSchemaShapeSha256)
           ? item.inputSchemaShapeSha256.toLowerCase()
@@ -264,7 +269,9 @@ function transcriptEvidence(value: unknown): DurableClaudeTranscriptEvidence | n
   ) {
     return null;
   }
-  const files = evidence.files.map(transcriptFile);
+  const files = evidence.files
+    .slice(0, MAX_DURABLE_FILES)
+    .map(transcriptFile);
   if (files.some((file) => file === null)) return null;
   const durableFiles = files as DurableTranscriptFile[];
   const parseGaps = [
@@ -274,6 +281,9 @@ function transcriptEvidence(value: unknown): DurableClaudeTranscriptEvidence | n
     ...durableFiles
       .filter((file) => file.toolSchemaProjectionStatus === "partial")
       .map((file) => `tool_schema_projection_truncated:${file.fileName}`),
+    ...(evidence.files.length > MAX_DURABLE_FILES
+      ? ["transcript_file_projection_truncated"]
+      : []),
   ].slice(0, MAX_PARSE_GAPS);
   return {
     schema: "paperclip.claude-transcript-completion-evidence.v1",
