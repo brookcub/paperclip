@@ -17262,9 +17262,14 @@ export function heartbeatService(
     });
     snapshot.executionTargetRevision = executionTarget.revision;
     const preference = readPaperclipSkillSyncPreference(config);
-    // Read the selected skill authorities before the delivery resolver touches
-    // their local sources. A changed row between these reads is not a stable
-    // phase-A admission and remains unavailable for this run.
+    const skillVersionPinsEnabled = currentInstanceSettings.experimental.enableBetaSkills === true;
+    snapshot.skillVersionPinsEnabled = skillVersionPinsEnabled;
+    // Reconcile bundled inventory before sampling its rows. In particular, the
+    // bundled operational skill can be refreshed here; sampling it first would
+    // make this preflight invalidate its own authoritative row. listFull does
+    // not resolve or materialize runtime sources, so the before/after check
+    // below still detects a source-row change during that work.
+    await companySkills.listFull(agent.companyId);
     const configuredSkillKeys = Array.from(new Set([
       PAPERCLIP_OPERATIONAL_SKILL_KEY,
       ...preference.desiredSkillEntries.map((entry) => entry.key),
@@ -17275,8 +17280,6 @@ export function heartbeatService(
         .select({ key: companySkillsTable.key, currentVersionId: companySkillsTable.currentVersionId, updatedAt: companySkillsTable.updatedAt })
         .from(companySkillsTable)
         .where(and(eq(companySkillsTable.companyId, agent.companyId), inArray(companySkillsTable.key, configuredSkillKeys)));
-    const skillVersionPinsEnabled = currentInstanceSettings.experimental.enableBetaSkills === true;
-    snapshot.skillVersionPinsEnabled = skillVersionPinsEnabled;
     // This is phase A: it uses the same delivery resolver as dispatch, before
     // any run-start mutation. Materialization is deliberately outside locks.
     const entries = await companySkills.listRuntimeSkillEntries(agent.companyId, {

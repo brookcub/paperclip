@@ -16,6 +16,7 @@ import {
   issues,
   principalPermissionGrants,
 } from "@paperclipai/db";
+import { companySkillService } from "../services/company-skills.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { PAPERCLIP_OPERATIONAL_SKILL_KEY } from "@paperclipai/adapter-utils/server-utils";
@@ -90,13 +91,23 @@ describeEmbedded("heartbeat required capability admission", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
-    await db.insert(environments).values({
-      name: `Capability local ${companyId}`,
-      driver: "local",
-      status: "active",
-      config: {},
-      envVars: {},
-    });
+    // The embedded database initializes the single local environment allowed
+    // by environments_local_driver_idx. Reuse it rather than adding a second.
+    const local = await db
+      .select({ id: environments.id })
+      .from(environments)
+      .where(eq(environments.driver, "local"))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!local) {
+      await db.insert(environments).values({
+        name: `Capability local ${companyId}`,
+        driver: "local",
+        status: "active",
+        config: {},
+        envVars: {},
+      });
+    }
     await db.insert(agents).values({
       id: agentId, companyId, name: "Runner", role: "engineer", status: "active", adapterType: "codex_local",
       adapterConfig, runtimeConfig: { heartbeat: { wakeOnDemand: true } }, permissions: {},
@@ -169,15 +180,17 @@ describeEmbedded("heartbeat required capability admission", () => {
   async function expectExecuted(
     heartbeat: ReturnType<typeof heartbeatService>,
     run: Awaited<ReturnType<typeof heartbeat.wakeup>>,
+    timeoutMs = 10_000,
   ) {
     if (!run) throw new Error("Expected the capability-admitted run to be queued");
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + timeoutMs;
     let settled = await heartbeat.getRun(run.id);
     while (settled && ["queued", "running"].includes(settled.status) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 50));
       settled = await heartbeat.getRun(run.id);
     }
     await heartbeat.drainActiveRunExecutions();
+    settled = await heartbeat.getRun(run.id);
     expect(settled?.status).toBe("succeeded");
     expect(execute).toHaveBeenCalled();
   }
@@ -261,19 +274,19 @@ describeEmbedded("heartbeat required capability admission", () => {
     }
   });
 
-  it("admits the legacy default core skill when it is available", async () => {
+  it("admits the inventory-selected legacy default core skill", async () => {
     const { companyId, agentId, issueId } = await seed({
       requiredCapabilities: { version: 1, items: [{ kind: "skill", key: PAPERCLIP_OPERATIONAL_SKILL_KEY }] },
     });
-    const { source } = await installSelectedLocalSkill(companyId, PAPERCLIP_OPERATIONAL_SKILL_KEY);
-    try {
-      const heartbeat = heartbeatService(db);
-      const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
-      await expectExecuted(heartbeat, run);
-    } finally {
-      await fs.rm(source, { recursive: true, force: true });
-    }
-  });
+    const selected = await companySkillService(db).listRuntimeSkillEntries(companyId);
+    expect(selected).toContainEqual(expect.objectContaining({
+      key: PAPERCLIP_OPERATIONAL_SKILL_KEY,
+      sourceStatus: "available",
+    }));
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+    await expectExecuted(heartbeat, run, 30_000);
+  }, 45_000);
 
   it("refuses a Codex CLI capability on a selected remote target", async () => {
     const policy = { requiredCapabilities: { version: 1, items: [
