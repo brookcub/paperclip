@@ -29,6 +29,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  cancelPendingScheduledRetry: vi.fn(async () => null),
 }));
 
 const mockAgentService = vi.hoisted(() => ({
@@ -334,6 +335,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockHeartbeatService.getRun.mockReset();
     mockHeartbeatService.getActiveRunForAgent.mockReset();
     mockHeartbeatService.cancelRun.mockReset();
+    mockHeartbeatService.cancelPendingScheduledRetry.mockReset();
     mockAgentService.getById.mockReset();
     mockAgentService.list.mockReset();
     mockAgentService.resolveByReference.mockReset();
@@ -381,6 +383,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockHeartbeatService.getRun.mockResolvedValue(null);
     mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockHeartbeatService.cancelPendingScheduledRetry.mockResolvedValue(null);
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
     mockExternalObjectService.syncIssueSafely.mockResolvedValue(undefined);
     mockObserveCrossIssueInfluence.mockResolvedValue({
@@ -1153,7 +1156,7 @@ describe.sequential("issue comment reopen routes", () => {
         updatedAt: new Date(),
       }),
     );
-    mockHeartbeatService.cancelRun.mockResolvedValue({
+    mockHeartbeatService.cancelPendingScheduledRetry.mockResolvedValue({
       id: "retry-run-1",
       companyId: "company-1",
       agentId: "22222222-2222-4222-8222-222222222222",
@@ -1169,7 +1172,7 @@ describe.sequential("issue comment reopen routes", () => {
       "11111111-1111-4111-8111-111111111111",
       { status: "todo" },
     );
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelPendingScheduledRetry).toHaveBeenCalledWith("retry-run-1");
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -1218,7 +1221,7 @@ describe.sequential("issue comment reopen routes", () => {
       error: null,
       errorCode: null,
     });
-    mockHeartbeatService.cancelRun.mockRejectedValue(
+    mockHeartbeatService.cancelPendingScheduledRetry.mockRejectedValue(
       new Error("cancel failed"),
     );
 
@@ -1227,7 +1230,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: "I added the missing detail; please continue." });
 
     expect(res.status).toBe(500);
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelPendingScheduledRetry).toHaveBeenCalledWith("retry-run-1");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(
@@ -1249,7 +1252,7 @@ describe.sequential("issue comment reopen routes", () => {
       "11111111-1111-4111-8111-111111111111",
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
-    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelPendingScheduledRetry).not.toHaveBeenCalled();
     await waitForWakeup(() =>
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         "22222222-2222-4222-8222-222222222222",
@@ -1258,6 +1261,34 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       ),
     );
+  });
+
+  it("does not cancel or reopen an in-progress retry that has already started", async () => {
+    const issue = {
+      ...makeIssue("in_progress"),
+      executionRunId: "retry-run-1",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue({
+      runId: "retry-run-1",
+      status: "running",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      agentName: "CodexCoder",
+      retryOfRunId: "source-run-1",
+      scheduledRetryAt: new Date("2026-05-18T14:00:00.000Z"),
+      scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure",
+      error: null,
+      errorCode: null,
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Here is more context while you work." });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelPendingScheduledRetry).not.toHaveBeenCalled();
   });
 
   it("skips the assignee wakeup when the issue is concurrently cancelled while the comment is being written", async () => {
@@ -1972,7 +2003,7 @@ describe.sequential("issue comment reopen routes", () => {
         updatedAt: new Date(),
       }),
     );
-    mockHeartbeatService.cancelRun.mockResolvedValue({
+    mockHeartbeatService.cancelPendingScheduledRetry.mockResolvedValue({
       id: "retry-run-1",
       companyId: "company-1",
       agentId: "22222222-2222-4222-8222-222222222222",
@@ -1992,7 +2023,7 @@ describe.sequential("issue comment reopen routes", () => {
         actorUserId: "local-board",
       }),
     );
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelPendingScheduledRetry).toHaveBeenCalledWith("retry-run-1");
     await waitForWakeup(() =>
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         "22222222-2222-4222-8222-222222222222",
@@ -2025,7 +2056,7 @@ describe.sequential("issue comment reopen routes", () => {
       error: null,
       errorCode: null,
     });
-    mockHeartbeatService.cancelRun.mockRejectedValue(
+    mockHeartbeatService.cancelPendingScheduledRetry.mockRejectedValue(
       new Error("cancel failed"),
     );
 
@@ -2034,7 +2065,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ comment: "Retry window is over; please continue." });
 
     expect(res.status).toBe(500);
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("retry-run-1");
+    expect(mockHeartbeatService.cancelPendingScheduledRetry).toHaveBeenCalledWith("retry-run-1");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalledWith(

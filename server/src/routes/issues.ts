@@ -4261,7 +4261,10 @@ export function issueRoutes(
     if (!scheduledRetryRunId) return null;
 
     try {
-      const cancelled = await heartbeat.cancelRun(scheduledRetryRunId);
+      const cancelled = await heartbeat.cancelPendingScheduledRetry(
+        scheduledRetryRunId,
+      );
+      if (!cancelled) return null;
       const cancelledRunId = cancelled?.id ?? scheduledRetryRunId;
       await logActivity(db, {
         companyId: input.issue.companyId,
@@ -12966,7 +12969,8 @@ export function issueRoutes(
           : null;
       const shouldResumeInProgressScheduledRetry =
         !!scheduledRetryForHumanComment &&
-        scheduledRetryForHumanComment.agentId === requestedAssigneeAgentId;
+        scheduledRetryForHumanComment.agentId === requestedAssigneeAgentId &&
+        ["scheduled_retry", "queued"].includes(scheduledRetryForHumanComment.status);
       const assigneeSelfCommentOnTerminal =
         isAssigneeSelfCommentOnTerminalIssue({
           hasCommentBody: !!commentBody,
@@ -13096,21 +13100,10 @@ export function issueRoutes(
       if (hiddenAtRaw !== undefined) {
         updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
       }
-      if (
-        commentBody &&
-        effectiveMoveToTodoRequested &&
-        (isClosed ||
-          (isBlocked && !hasUnresolvedFirstClassBlockers) ||
-          shouldResumeInProgressScheduledRetry) &&
-        updateFields.status === undefined
-      ) {
-        updateFields.status = "todo";
-      }
       let cancelledScheduledRetryRunId: string | null = null;
       if (
         commentBody &&
-        shouldResumeInProgressScheduledRetry &&
-        updateFields.status === "todo"
+        shouldResumeInProgressScheduledRetry
       ) {
         cancelledScheduledRetryRunId =
           await cancelScheduledRetrySupersededByComment({
@@ -13118,6 +13111,16 @@ export function issueRoutes(
             issue: existing,
             actor,
           });
+      }
+      if (
+        commentBody &&
+        effectiveMoveToTodoRequested &&
+        (isClosed ||
+          (isBlocked && !hasUnresolvedFirstClassBlockers) ||
+          cancelledScheduledRetryRunId) &&
+        updateFields.status === undefined
+      ) {
+        updateFields.status = "todo";
       }
       if (req.body.executionPolicy !== undefined) {
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
@@ -13929,6 +13932,7 @@ export function issueRoutes(
         issue.status === "todo";
       const reopenFromStatus = reopened ? existing.status : null;
       const scheduledRetrySupersededByComment =
+        cancelledScheduledRetryRunId !== null &&
         shouldResumeInProgressScheduledRetry &&
         previous.status !== undefined &&
         existing.status === "in_progress" &&
@@ -17385,7 +17389,8 @@ export function issueRoutes(
           : null;
       const shouldResumeInProgressScheduledRetry =
         !!scheduledRetryForHumanComment &&
-        scheduledRetryForHumanComment.agentId === issue.assigneeAgentId;
+        scheduledRetryForHumanComment.agentId === issue.assigneeAgentId &&
+        ["scheduled_retry", "queued"].includes(scheduledRetryForHumanComment.status);
       const assigneeSelfCommentOnTerminal =
         isAssigneeSelfCommentOnTerminalIssue({
           hasCommentBody: true,
@@ -17482,24 +17487,23 @@ export function issueRoutes(
       const commentReferenceSummaryBefore =
         await issueReferencesSvc.listIssueReferenceSummary(issue.id);
 
-      let scheduledRetrySupersededByComment = false;
       let cancelledScheduledRetryRunId: string | null = null;
+      if (shouldResumeInProgressScheduledRetry && issue.status === "in_progress") {
+        cancelledScheduledRetryRunId =
+          await cancelScheduledRetrySupersededByComment({
+            scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
+            issue,
+            actor,
+          });
+      }
+      const scheduledRetrySupersededByComment =
+        cancelledScheduledRetryRunId !== null;
       if (
         effectiveMoveToTodoRequested &&
         (isClosed ||
           (isBlocked && !hasUnresolvedFirstClassBlockers) ||
-          shouldResumeInProgressScheduledRetry)
+          scheduledRetrySupersededByComment)
       ) {
-        scheduledRetrySupersededByComment =
-          shouldResumeInProgressScheduledRetry &&
-          issue.status === "in_progress";
-        cancelledScheduledRetryRunId = scheduledRetrySupersededByComment
-          ? await cancelScheduledRetrySupersededByComment({
-              scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
-              issue,
-              actor,
-            })
-          : null;
         const reopenedIssue = await svc.update(id, { status: "todo" });
         if (!reopenedIssue) {
           res.status(404).json({ error: "Issue not found" });

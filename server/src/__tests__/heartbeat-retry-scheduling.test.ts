@@ -2067,6 +2067,36 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
   describe("run-dispatch module transactions", () => {
+    it("does not cancel a retry that wins the pending-retry cancellation race", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const sourceRunId = randomUUID();
+      const now = new Date("2026-05-01T00:00:00.000Z");
+
+      await seedRetryFixture({ runId: sourceRunId, companyId, agentId, now, errorCode: "adapter_failed" });
+      const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+
+      const [cancelled, claimed] = await Promise.all([
+        heartbeat.cancelPendingScheduledRetry(scheduled.run.id),
+        db.update(heartbeatRuns)
+          .set({ status: "running", startedAt: now, updatedAt: now })
+          .where(and(
+            eq(heartbeatRuns.id, scheduled.run.id),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+          ))
+          .returning(),
+      ]);
+
+      expect((cancelled ? 1 : 0) + (claimed.length ? 1 : 0)).toBe(1);
+      const [row] = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id));
+      expect(row?.status).toBe(cancelled ? "cancelled" : "running");
+    });
+
     it("promotes a due scheduled retry exactly once under concurrent promotion attempts", async () => {
       const companyId = randomUUID();
       const agentId = randomUUID();

@@ -28659,6 +28659,43 @@ export function heartbeatService(
     }
   }
 
+  async function cancelPendingScheduledRetryInternal(
+    runId: string,
+    reason = "Cancelled because a new comment superseded this pending retry",
+  ) {
+    const cancellation = await setRunStatusFromLive(
+      runId,
+      "cancelled",
+      ["scheduled_retry", "queued"],
+      {
+        finishedAt: new Date(),
+        error: reason,
+        errorCode: "cancelled",
+      },
+    );
+    if (!cancellation.updated || !cancellation.run) return null;
+
+    const cancelled = cancellation.run;
+    await setWakeupStatus(cancelled.wakeupRequestId, "cancelled", {
+      finishedAt: cancelled.finishedAt ?? new Date(),
+      error: reason,
+    });
+    await appendRunEvent(cancelled, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "pending scheduled retry cancelled",
+    });
+    await releaseIssueExecutionAndPromote(cancelled, {
+      suppressImmediateRecovery: true,
+    });
+    await finalizeAgentStatus(cancelled.agentId, "cancelled", undefined, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(cancelled),
+    });
+    await startNextQueuedRunForAgent(cancelled.agentId);
+    return cancelled;
+  }
+
   async function cancelActiveForAgentInternal(
     agentId: string,
     reason = "Cancelled due to agent pause",
@@ -29289,6 +29326,8 @@ export function heartbeatService(
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),
+    cancelPendingScheduledRetry: (runId: string, reason?: string) =>
+      cancelPendingScheduledRetryInternal(runId, reason),
 
     /**
      * Pause-only. Emits errorCode "agent_paused" unconditionally; its sole caller is the
