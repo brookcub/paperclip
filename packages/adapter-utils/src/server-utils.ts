@@ -1942,9 +1942,9 @@ export function stringifyPaperclipWakePayload(
 }
 
 /**
- * Windows limits the entire process environment block to 32,767 UTF-16 code
- * units. Keep inline wake JSON below 8K so ordinary inherited/runtime entries
- * retain most of that budget; larger payloads use the run-owned scratch file.
+ * Keep inline wake JSON below this conservative transport budget. JavaScript
+ * UTF-16 code units match Windows environment-string units, while leaving
+ * substantial space for the surrounding inherited and runtime environment.
  */
 export const MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS = 8_192;
 export const PAPERCLIP_WAKE_PAYLOAD_JSON_ENV = "PAPERCLIP_WAKE_PAYLOAD_JSON";
@@ -1989,6 +1989,11 @@ async function resolveOwnedPaperclipRunScratch(input: {
   const markerPath = path.join(dir, PAPERCLIP_RUN_SCRATCH_MARKER);
   let marker: Record<string, unknown>;
   try {
+    const scratchStat = await fs.lstat(dir);
+    const markerStat = await fs.lstat(markerPath);
+    if (!scratchStat.isDirectory() || scratchStat.isSymbolicLink() || markerStat.isSymbolicLink()) {
+      throw new Error("untrusted scratch path");
+    }
     const parsed = JSON.parse(await fs.readFile(markerPath, "utf8")) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid marker");
     marker = parsed as Record<string, unknown>;
@@ -2019,10 +2024,18 @@ export async function preparePaperclipWakePayloadTransport(input: {
   if (payload && payload.length > MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS) {
     const scratchDir = await resolveOwnedPaperclipRunScratch(input);
     const payloadDir = path.join(scratchDir, PAPERCLIP_WAKE_PAYLOAD_ASSET_KEY);
-    await fs.mkdir(payloadDir, { recursive: true, mode: 0o700 });
+    await fs.mkdir(payloadDir, { mode: 0o700 });
+    const payloadDirStat = await fs.lstat(payloadDir);
+    if (!payloadDirStat.isDirectory() || payloadDirStat.isSymbolicLink()) {
+      throw new Error("Large Paperclip wake payload scratch directory is not private.");
+    }
     localPath = path.join(payloadDir, PAPERCLIP_WAKE_PAYLOAD_FILENAME);
-    await fs.writeFile(localPath, payload, { encoding: "utf8", mode: 0o600 });
-    await fs.chmod(localPath, 0o600);
+    const payloadHandle = await fs.open(localPath, "wx", 0o600);
+    try {
+      await payloadHandle.writeFile(payload, "utf8");
+    } finally {
+      await payloadHandle.close();
+    }
     asset = { key: PAPERCLIP_WAKE_PAYLOAD_ASSET_KEY, localDir: payloadDir, followSymlinks: false };
     contentHash = createHash("sha256").update(payload, "utf8").digest("hex");
   }

@@ -125,6 +125,7 @@ interface ClaudeRuntimeConfig {
   timeoutSec: number;
   graceSec: number;
   extraArgs: string[];
+  wakePayloadTransport: Awaited<ReturnType<typeof preparePaperclipWakePayloadTransport>>;
 }
 
 export function claudeSessionCwdMatchesExecutionTarget(input: {
@@ -365,6 +366,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     timeoutSec,
     graceSec,
     extraArgs,
+    wakePayloadTransport,
   };
 }
 
@@ -483,6 +485,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutSec,
     graceSec,
     extraArgs,
+    wakePayloadTransport,
   } = runtimeConfig;
   let loggedEnv = initialLoggedEnv;
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
