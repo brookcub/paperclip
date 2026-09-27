@@ -191,6 +191,26 @@ describe("codex_local stderr fallback error derivation", () => {
     });
   });
 
+  it("does not attribute an ordinary failed attempt to its older runtime session", async () => {
+    const olderRuntimeSession = "019caaaa-1234-7abc-8def-0123456789ab";
+    mockFailedProcess("Error: upstream failed before session start");
+    const context = buildContext() as { runtime: { sessionId: string | null } };
+    context.runtime.sessionId = olderRuntimeSession;
+
+    const result = await execute(context as never);
+
+    expect(result.sessionId).toBe(olderRuntimeSession);
+    expect(result).toMatchObject({
+      resultJson: {
+        completionEvidence: {
+          sessionId: null,
+          status: "unavailable",
+          parseGaps: ["codex_run_session_not_observed"],
+        },
+      },
+    });
+  });
+
   it("captures only the monitor attempt's observed thread ID", async () => {
     const threadId = "019cabcd-1234-7abc-8def-0123456789ab";
     runAdapterExecutionTargetProcess.mockImplementationOnce(async (...args: unknown[]) => {

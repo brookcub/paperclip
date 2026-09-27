@@ -1533,7 +1533,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         authRefreshFailure ??
         (providerQuota ? "provider_quota" : transientUpstream || harnessCrash ? "transient_upstream" : null);
 
-      const completionEvidence = await captureAttemptCompletionEvidence(resolvedSessionId);
+      const completionEvidence = await captureAttemptCompletionEvidence(attempt.parsed.sessionId);
       return {
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
