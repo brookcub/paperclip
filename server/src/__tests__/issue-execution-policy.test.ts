@@ -170,16 +170,19 @@ describe("normalizeIssueExecutionPolicy", () => {
     });
   });
 
-  it("does not drop capabilities while removing a monitor", () => {
+  it("does not drop capabilities or review limits while removing a monitor", () => {
     const policy = normalizeIssueExecutionPolicy({
       monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" },
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      maxReviewRounds: 1,
       requiredCapabilities: {
         version: 1,
         items: [{ kind: "permission", key: "agents:suggest-changes" }],
       },
     });
     expect(stripMonitorFromExecutionPolicy(policy)).toMatchObject({
-      stages: [],
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      maxReviewRounds: 1,
       requiredCapabilities: {
         version: 1,
         items: [{ kind: "permission", key: "agents:suggest-changes" }],
