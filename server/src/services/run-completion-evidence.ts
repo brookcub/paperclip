@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 type RecordValue = Record<string, unknown>;
 type TraceMetadata = {
   id: string;
@@ -14,6 +16,7 @@ type ToolSchemaShape = {
   additionalProperties: boolean | null;
   enumCount: number | null;
 };
+type EvidenceAvailability = "available" | "unavailable";
 type TranscriptFile = {
   role: "parent" | "child";
   fileName: string;
@@ -21,6 +24,8 @@ type TranscriptFile = {
   bytes: number;
   models: string[];
   effort: string[];
+  effortStatus: EvidenceAvailability;
+  toolSchemaStatus: EvidenceAvailability;
   promptSnapshotTools: Array<{
     timestamp: string | null;
     tools: Array<{
@@ -64,6 +69,7 @@ const MAX_SCHEMA_PROPERTIES = 100;
 const MAX_SCHEMA_VARIANTS = 20;
 const MAX_SCHEMA_NODES = 64;
 const MAX_PROJECTION_CHARS = 12_000;
+const MAX_PROJECTIONS_PER_FILE = 50;
 const ID_RE = /^[A-Za-z0-9-]{1,200}$/;
 const FILE_RE = /^(?:[A-Za-z0-9-]+|agent-[A-Za-z0-9-]+)\.jsonl$/;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
@@ -93,6 +99,17 @@ function safeValues(value: unknown, limit: number): string[] {
   ))]
     .sort((left, right) => left.localeCompare(right))
     .slice(0, limit);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const valueRecord = record(value);
+  if (valueRecord) {
+    return `{${Object.keys(valueRecord).sort((left, right) => left.localeCompare(right))
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(valueRecord[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 function safeShape(
@@ -151,6 +168,8 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
     file.bytes < 0 ||
     file.bytes > 1024 * 1024 * 1024 ||
     !Array.isArray(file.promptSnapshotTools) ||
+    (file.effortStatus !== "available" && file.effortStatus !== "unavailable") ||
+    (file.toolSchemaStatus !== "available" && file.toolSchemaStatus !== "unavailable") ||
     typeof file.malformedRecordCount !== "number" ||
     !Number.isSafeInteger(file.malformedRecordCount) ||
     file.malformedRecordCount < 0
@@ -162,7 +181,7 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
   if (file.promptSnapshotTools.length > MAX_SNAPSHOTS_PER_FILE) {
     toolSchemaProjectionStatus = "partial";
   }
-  const promptSnapshotToolProjections = file.promptSnapshotTools
+  const allPromptSnapshotToolProjections = file.promptSnapshotTools
     .slice(0, MAX_SNAPSHOTS_PER_FILE)
     .flatMap((value) => {
       const snapshot = record(value);
@@ -183,6 +202,9 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
           ? item.inputSchemaShapeSha256.toLowerCase()
           : null;
         if ((inputSchemaShape === null) !== (inputSchemaShapeSha256 === null)) return [];
+        const durableSchemaHash = inputSchemaShape
+          ? createHash("sha256").update(canonicalJson(inputSchemaShape)).digest("hex")
+          : null;
         const projection = JSON.stringify({
           timestamp: typeof snapshot.timestamp === "string" &&
             Number.isFinite(Date.parse(snapshot.timestamp))
@@ -190,7 +212,7 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
             : null,
           name: item.name,
           inputSchemaShape,
-          inputSchemaShapeSha256,
+          inputSchemaShapeSha256: durableSchemaHash,
         });
         if (projection.length <= MAX_PROJECTION_CHARS) return [projection];
         toolSchemaProjectionStatus = "partial";
@@ -201,11 +223,16 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
             : null,
           name: item.name,
           inputSchemaShape: null,
-          inputSchemaShapeSha256,
+          inputSchemaShapeSha256: durableSchemaHash,
           reason: "safe_structure_exceeds_event_projection_limit",
         })];
       });
     });
+  if (allPromptSnapshotToolProjections.length > MAX_PROJECTIONS_PER_FILE) {
+    toolSchemaProjectionStatus = "partial";
+  }
+  const promptSnapshotToolProjections = allPromptSnapshotToolProjections
+    .slice(0, MAX_PROJECTIONS_PER_FILE);
 
   return {
     role: file.role,
@@ -214,6 +241,8 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
     bytes: file.bytes,
     models: safeValues(file.models, MAX_MODELS_PER_FILE),
     effort: safeValues(file.effort, MAX_EFFORTS_PER_FILE),
+    effortStatus: file.effortStatus,
+    toolSchemaStatus: file.toolSchemaStatus,
     promptSnapshotToolProjections,
     toolSchemaProjectionStatus,
     malformedRecordCount: file.malformedRecordCount,

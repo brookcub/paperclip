@@ -39,6 +39,8 @@ describe("captureClaudeTranscriptCompletionEvidence", () => {
       role: "child",
       models: ["claude-sonnet"],
       effort: ["low"],
+      effortStatus: "available",
+      toolSchemaStatus: "available",
       promptSnapshotTools: [{
         tools: [{ name: "Read" }, { name: "SubagentHandback" }],
       }],
@@ -64,5 +66,22 @@ describe("captureClaudeTranscriptCompletionEvidence", () => {
     const { root } = await fixture();
     const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId: "../outside" });
     expect(evidence).toMatchObject({ status: "unavailable", files: [], parseGaps: ["invalid_session_id"] });
+  });
+
+  it("marks absent tool snapshots and effort unavailable instead of inventing them", async () => {
+    const { root, sessionId, project } = await fixture();
+    await writeFile(
+      path.join(project, `${sessionId}.jsonl`),
+      JSON.stringify({ type: "assistant", message: { model: "claude-opus" } }),
+    );
+    const evidence = await captureClaudeTranscriptCompletionEvidence({ configDir: root, sessionId });
+    expect(evidence).toMatchObject({
+      status: "partial",
+      files: [{ effortStatus: "unavailable", toolSchemaStatus: "unavailable" }],
+    });
+    expect(evidence.parseGaps).toEqual(expect.arrayContaining([
+      "parent_effort_unavailable",
+      "parent_tool_schema_unavailable",
+    ]));
   });
 });

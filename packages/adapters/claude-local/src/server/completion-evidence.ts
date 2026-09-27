@@ -19,7 +19,7 @@ export type ClaudeTranscriptCompletionEvidence = {
   status: EvidenceStatus;
   source: "claude_config_transcript";
   sessionId: string | null;
-  /** Names only: prompt snapshot schemas and descriptions are never retained. */
+  /** Safe structural projection: never descriptions, defaults, examples, or enum values. */
   toolSchemaProjection: "prompt_snapshot_safe_structure.v1";
   files: Array<{
     role: "parent" | "child";
@@ -29,6 +29,8 @@ export type ClaudeTranscriptCompletionEvidence = {
     models: string[];
     /** Raw top-level transcript field, never a requested or configured effort. */
     effort: string[];
+    effortStatus: "available" | "unavailable";
+    toolSchemaStatus: "available" | "unavailable";
     promptSnapshotTools: Array<{
       timestamp: string | null;
       tools: Array<{
@@ -214,6 +216,10 @@ function inspectTranscript(
     bytes: Buffer.byteLength(contents),
     models: [...models].sort((left, right) => left.localeCompare(right)),
     effort: [...effort].sort((left, right) => left.localeCompare(right)),
+    effortStatus: effort.size > 0 ? "available" : "unavailable",
+    toolSchemaStatus: promptSnapshotTools.some((snapshot) => snapshot.tools.length > 0)
+      ? "available"
+      : "unavailable",
     promptSnapshotTools,
     malformedRecordCount,
   };
@@ -275,6 +281,12 @@ export async function captureClaudeTranscriptCompletionEvidence(input: {
   if (parentEvidence.malformedRecordCount > 0) {
     parseGaps.push("parent_transcript_malformed_records");
   }
+  if (parentEvidence.effortStatus === "unavailable") {
+    parseGaps.push("parent_effort_unavailable");
+  }
+  if (parentEvidence.toolSchemaStatus === "unavailable") {
+    parseGaps.push("parent_tool_schema_unavailable");
+  }
 
   const subagentsDir = path.join(path.dirname(parent), sessionId, "subagents");
   const entries = await readdir(subagentsDir, { withFileTypes: true }).catch(() => []);
@@ -298,6 +310,12 @@ export async function captureClaudeTranscriptCompletionEvidence(input: {
     files.push(childEvidence);
     if (childEvidence.malformedRecordCount > 0) {
       parseGaps.push(`child_transcript_malformed_records:${entry.name}`);
+    }
+    if (childEvidence.effortStatus === "unavailable") {
+      parseGaps.push(`child_effort_unavailable:${entry.name}`);
+    }
+    if (childEvidence.toolSchemaStatus === "unavailable") {
+      parseGaps.push(`child_tool_schema_unavailable:${entry.name}`);
     }
   }
 

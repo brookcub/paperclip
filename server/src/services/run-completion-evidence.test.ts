@@ -19,6 +19,8 @@ const transcript = {
     bytes: 42,
     models: ["claude-sonnet"],
     effort: ["low"],
+    effortStatus: "available" as const,
+    toolSchemaStatus: "available" as const,
     promptSnapshotTools: [{
       timestamp: null,
       tools: [{
@@ -130,7 +132,7 @@ describe("run completion evidence", () => {
   });
 
   it("keeps storage limits explicit and readable", () => {
-    const manyTools = Array.from({ length: 51 }, (_, index) => ({
+    const manyTools = Array.from({ length: 30 }, (_, index) => ({
       name: `Tool${index}`,
       inputSchemaShape: null,
       inputSchemaShapeSha256: null,
@@ -144,7 +146,10 @@ describe("run completion evidence", () => {
           prompt: "must not be copied",
           files: [{
             ...transcript.files[0],
-            promptSnapshotTools: [{ timestamp: null, tools: manyTools }],
+            promptSnapshotTools: [
+              { timestamp: null, tools: manyTools },
+              { timestamp: null, tools: manyTools },
+            ],
           }],
         },
       },
@@ -163,6 +168,37 @@ describe("run completion evidence", () => {
     });
     expect(JSON.stringify(stored)).not.toContain("must not be copied");
     expect(JSON.stringify(stored)).not.toContain('"_truncated":true');
+  });
+
+  it("rehashes the final safe schema shape rather than retaining a stale source hash", () => {
+    const evidence = buildRunCompletionEvidence({
+      adapterType: "claude_local",
+      adapterResultJson: {
+        completionEvidence: {
+          ...transcript,
+          files: [{
+            ...transcript.files[0],
+            promptSnapshotTools: [{
+              timestamp: null,
+              tools: [{
+                name: "Read",
+                inputSchemaShape: {
+                  type: ["object"], required: ["path"],
+                  properties: { path: { type: ["string"], required: [], properties: {}, items: null, variants: [], additionalProperties: null, enumCount: null } },
+                  items: null, variants: [], additionalProperties: false, enumCount: null,
+                },
+                inputSchemaShapeSha256: "a".repeat(64),
+              }],
+            }],
+          }],
+        },
+      },
+      providerTrace: null,
+      providerTraceRequested: false,
+    });
+    const projection = JSON.parse(evidence.transcript.files[0].promptSnapshotToolProjections[0]);
+    expect(projection.inputSchemaShapeSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(projection.inputSchemaShapeSha256).not.toBe("a".repeat(64));
   });
 
   it("does not claim a Claude transcript for another adapter", () => {
