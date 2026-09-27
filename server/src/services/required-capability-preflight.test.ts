@@ -55,7 +55,7 @@ describe("required capability preflight", () => {
   });
 
   it("refuses CLI tool admission when the resolved target is unknown or remote Codex", () => {
-    const requirement = [{ kind: "tool", runtime: "codex_cli" as const, name: "shell", authorization: "conditional_ok" as const }];
+    const requirement = [{ kind: "tool" as const, runtime: "codex_cli" as const, name: "shell", authorization: "conditional_ok" as const }];
     for (const [targetIsRemote, reason] of [[null, "execution_target_unresolved"], [true, "remote_codex_policy_unqualified"]] as const) {
       const result = evaluateRequiredCapabilities({
         requirements: requirement,

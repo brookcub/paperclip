@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -32,31 +32,64 @@ const describeEmbedded = support.supported ? describe : describe.skip;
 describeEmbedded("heartbeat required capability admission", () => {
   let db!: ReturnType<typeof createDb>;
   let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let oldPaperclipHome: string | undefined;
+  let oldPaperclipApiUrl: string | undefined;
+  let paperclipHome: string | null = null;
 
   beforeAll(async () => {
     temp = await startEmbeddedPostgresTestDatabase("paperclip-required-capabilities-");
     db = createDb(temp.connectionString);
+    oldPaperclipHome = process.env.PAPERCLIP_HOME;
+    paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-required-capabilities-home-"));
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    oldPaperclipApiUrl = process.env.PAPERCLIP_API_URL;
+    process.env.PAPERCLIP_API_URL = "http://127.0.0.1:3100/api";
   }, 60_000);
-  afterAll(async () => { await temp?.cleanup(); });
+  afterAll(async () => {
+    if (oldPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+    else process.env.PAPERCLIP_HOME = oldPaperclipHome;
+    if (oldPaperclipApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
+    else process.env.PAPERCLIP_API_URL = oldPaperclipApiUrl;
+    if (paperclipHome) await fs.rm(paperclipHome, { recursive: true, force: true });
+    await db.$client?.end?.({ timeout: 0 });
+    await temp?.cleanup();
+  });
   afterEach(async () => {
+    await heartbeatService(db).drainActiveRunExecutions();
     execute.mockReset();
     execute.mockImplementation(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "capability test", provider: "test", model: "test" }));
-    await db.delete(heartbeatRuns);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(principalPermissionGrants);
-    await db.delete(companyMemberships);
-    await db.delete(companySkills);
-    await db.delete(agents);
-    await db.delete(environments);
-    await db.delete(companies);
+    await db.execute(sql.raw(`
+      TRUNCATE TABLE
+        "activity_log",
+        "environment_leases",
+        "environments",
+        "heartbeat_run_events",
+        "heartbeat_runs",
+        "agent_wakeup_requests",
+        "agent_runtime_state",
+        "principal_permission_grants",
+        "company_memberships",
+        "issue_comments",
+        "issues",
+        "company_skill_versions",
+        "company_skills",
+        "agents",
+        "companies"
+      RESTART IDENTITY CASCADE
+    `));
   });
 
   async function seed(policy: Record<string, unknown>, adapterConfig: Record<string, unknown> = { engine: "cli" }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Capability test", issuePrefix: "CAP", requireBoardApprovalForNewAgents: false });
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Capability test",
+      issuePrefix: `CAP${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
     await db.insert(environments).values({
       name: `Capability local ${companyId}`,
       driver: "local",
@@ -133,6 +166,43 @@ describeEmbedded("heartbeat required capability admission", () => {
     expect(execute).not.toHaveBeenCalled();
   }
 
+  async function expectExecuted(
+    heartbeat: ReturnType<typeof heartbeatService>,
+    run: Awaited<ReturnType<typeof heartbeat.wakeup>>,
+  ) {
+    if (!run) throw new Error("Expected the capability-admitted run to be queued");
+    const deadline = Date.now() + 10_000;
+    let settled = await heartbeat.getRun(run.id);
+    while (settled && ["queued", "running"].includes(settled.status) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      settled = await heartbeat.getRun(run.id);
+    }
+    await heartbeat.drainActiveRunExecutions();
+    expect(settled?.status).toBe("succeeded");
+    expect(execute).toHaveBeenCalled();
+  }
+
+  async function wakeQueuedAutomation(
+    heartbeat: ReturnType<typeof heartbeatService>,
+    companyId: string,
+    agentId: string,
+    issueId: string,
+  ) {
+    const [comment] = await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorUserId: "capability-test-user",
+      body: "Please continue.",
+    }).returning();
+    return wakeAutomation(
+      heartbeat,
+      agentId,
+      issueId,
+      { wakeCommentIds: [comment!.id] },
+      { commentId: comment!.id },
+    );
+  }
+
   it("cancels an unmet catalog before startedAt or provider execution", async () => {
     const { companyId, agentId, issueId } = await seed({ requiredCapabilities: { version: 1, items: [
       { kind: "tool", runtime: "claude_cli", name: "Bash", authorization: "conditional_ok" },
@@ -148,8 +218,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     const { agentId, issueId } = await seed({});
     const heartbeat = heartbeatService(db);
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
-    if (run) await heartbeat.waitForRunExecutionDrain(run.id);
-    expect(execute).toHaveBeenCalled();
+    await expectExecuted(heartbeat, run);
   });
 
   it("admits the selected local Codex shell capability", async () => {
@@ -158,8 +227,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     ] } });
     const heartbeat = heartbeatService(db);
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
-    if (run) await heartbeat.waitForRunExecutionDrain(run.id);
-    expect(execute).toHaveBeenCalled();
+    await expectExecuted(heartbeat, run);
   });
 
   it("admits the dispatch-created local default for a required Codex tool", async () => {
@@ -169,8 +237,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     await db.delete(environments).where(eq(environments.driver, "local"));
     const heartbeat = heartbeatService(db);
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
-    if (run) await heartbeat.waitForRunExecutionDrain(run.id);
-    expect(execute).toHaveBeenCalled();
+    await expectExecuted(heartbeat, run);
   });
 
   it("admits a selected local skill and an active agent grant", async () => {
@@ -188,8 +255,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     try {
       const heartbeat = heartbeatService(db);
       const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
-      if (run) await heartbeat.waitForRunExecutionDrain(run.id);
-      expect(execute).toHaveBeenCalled();
+      await expectExecuted(heartbeat, run);
     } finally {
       await fs.rm(source, { recursive: true, force: true });
     }
@@ -203,8 +269,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     try {
       const heartbeat = heartbeatService(db);
       const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
-      if (run) await heartbeat.waitForRunExecutionDrain(run.id);
-      expect(execute).toHaveBeenCalled();
+      await expectExecuted(heartbeat, run);
     } finally {
       await fs.rm(source, { recursive: true, force: true });
     }
@@ -242,7 +307,9 @@ describeEmbedded("heartbeat required capability admission", () => {
         ] } } }).where(eq(issues.id, issueId));
       },
     });
-    await wakeAutomation(heartbeat, agentId, issueId);
+    await wakeQueuedAutomation(heartbeat, companyId, agentId, issueId);
+    await heartbeat.drainActiveRunExecutions();
+    expect(changed).toBe(true);
     await expectUnstarted(companyId);
   });
 
@@ -259,7 +326,9 @@ describeEmbedded("heartbeat required capability admission", () => {
         await db.update(agents).set({ adapterConfig: { engine: "cli", disable: "shell_tool" } }).where(eq(agents.id, agentId));
       },
     });
-    await wakeAutomation(heartbeat, agentId, issueId);
+    await wakeQueuedAutomation(heartbeat, companyId, agentId, issueId);
+    await heartbeat.drainActiveRunExecutions();
+    expect(changed).toBe(true);
     await expectUnstarted(companyId);
   });
 
@@ -277,7 +346,9 @@ describeEmbedded("heartbeat required capability admission", () => {
         await db.update(environments).set({ driver: "sandbox" }).where(eq(environments.id, local!.id));
       },
     });
-    await wakeAutomation(heartbeat, agentId, issueId);
+    await wakeQueuedAutomation(heartbeat, companyId, agentId, issueId);
+    await heartbeat.drainActiveRunExecutions();
+    expect(changed).toBe(true);
     await expectUnstarted(companyId);
   });
 
@@ -295,7 +366,9 @@ describeEmbedded("heartbeat required capability admission", () => {
         await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, agentId));
       },
     });
-    await wakeAutomation(heartbeat, agentId, issueId);
+    await wakeQueuedAutomation(heartbeat, companyId, agentId, issueId);
+    await heartbeat.drainActiveRunExecutions();
+    expect(changed).toBe(true);
     await expectUnstarted(companyId);
   });
 
@@ -315,7 +388,9 @@ describeEmbedded("heartbeat required capability admission", () => {
       },
     });
     try {
-      await wakeAutomation(heartbeat, agentId, issueId);
+      await wakeQueuedAutomation(heartbeat, companyId, agentId, issueId);
+      await heartbeat.drainActiveRunExecutions();
+      expect(changed).toBe(true);
       await expectUnstarted(companyId);
     } finally {
       await fs.rm(source, { recursive: true, force: true });
@@ -339,7 +414,6 @@ describeEmbedded("heartbeat required capability admission", () => {
     const { context, payload } = makeContext(comment!.id);
     const heartbeat = heartbeatService(db);
     const run = await wakeAutomation(heartbeat, agentId, issueId, context, payload);
-    if (run) await heartbeat.waitForRunExecutionDrain(run.id);
-    expect(execute).toHaveBeenCalled();
+    await expectExecuted(heartbeat, run);
   });
 });
