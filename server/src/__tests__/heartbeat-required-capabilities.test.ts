@@ -5,7 +5,7 @@ import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai
 import { heartbeatService } from "../services/heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
-const execute = vi.hoisted(() => vi.fn());
+const execute = vi.hoisted(() => vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "capability test", provider: "test", model: "test" })));
 vi.mock("../adapters/index.js", async () => ({
   ...(await vi.importActual<typeof import("../adapters/index.js")>("../adapters/index.js")),
   getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute })),
@@ -25,6 +25,7 @@ describeEmbedded("heartbeat required capability admission", () => {
   afterAll(async () => { await temp?.cleanup(); });
   afterEach(async () => {
     execute.mockReset();
+    execute.mockImplementation(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "capability test", provider: "test", model: "test" }));
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(agents);
@@ -53,5 +54,23 @@ describeEmbedded("heartbeat required capability admission", () => {
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     expect(run).toMatchObject({ status: "cancelled", startedAt: null, errorCode: "required_capabilities_unavailable" });
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("preserves legacy execution when no catalog is declared", async () => {
+    const { agentId, issueId } = await seed({});
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+    if (run) await heartbeat.waitForRunExecutionDrain(run.id);
+    expect(execute).toHaveBeenCalled();
+  });
+
+  it("admits the selected local Codex shell capability", async () => {
+    const { agentId, issueId } = await seed({ requiredCapabilities: { version: 1, items: [
+      { kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" },
+    ] } });
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+    if (run) await heartbeat.waitForRunExecutionDrain(run.id);
+    expect(execute).toHaveBeenCalled();
   });
 });
