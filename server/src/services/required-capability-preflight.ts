@@ -27,7 +27,7 @@ export type CapabilityPreflightSnapshot = {
   allowedAgentPermissionKeys: string[];
   managedMcpRevision: string;
   skillRevisions: Array<{ key: string; versionId: string; currentVersionId: string | null }>;
-  skillVersionPinsEnabled: boolean;
+  skillVersionPinsEnabled: boolean | null;
 };
 
 export type CapabilityPreflight = {
@@ -60,7 +60,7 @@ export function capabilityPreflightSnapshotIsCurrent(
     snapshot.allowedAgentPermissionKeys.length === current.allowedAgentPermissionKeys.length &&
     snapshot.allowedAgentPermissionKeys.every((key, index) => key === current.allowedAgentPermissionKeys[index]) &&
     snapshot.managedMcpRevision === current.managedMcpRevision &&
-    snapshot.skillVersionPinsEnabled === current.skillVersionPinsEnabled &&
+    (snapshot.skillVersionPinsEnabled === null || snapshot.skillVersionPinsEnabled === current.skillVersionPinsEnabled) &&
     stableCapabilitySnapshot(snapshot.skillRevisions) === stableCapabilitySnapshot(current.skillRevisions);
 }
 

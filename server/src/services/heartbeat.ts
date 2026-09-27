@@ -17105,7 +17105,7 @@ export function heartbeatService(
           allowedAgentPermissionKeys: [],
           managedMcpRevision: "",
           skillRevisions: [],
-          skillVersionPinsEnabled: false,
+          skillVersionPinsEnabled: null,
         },
       };
     }
