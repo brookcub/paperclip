@@ -16,7 +16,11 @@ import {
   toolProfileEntries,
   toolProfiles,
 } from "@paperclipai/db";
-import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
+import type {
+  AdapterExecutionContext,
+  AdapterExecutionResult,
+  AdapterRuntimeMcpServer,
+} from "@paperclipai/adapter-utils";
 import type { PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-utils";
 import {
   getEmbeddedPostgresTestSupport,
@@ -45,9 +49,13 @@ async function waitForRunToFinish(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const run = await heartbeat.getRun(runId);
-    if (run && !["queued", "running"].includes(run.status)) return run;
+    if (run && !["queued", "running"].includes(run.status)) {
+      await heartbeat.waitForRunExecutionDrain(runId);
+      return await heartbeat.getRun(runId);
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  await heartbeat.waitForRunExecutionDrain(runId);
   return await heartbeat.getRun(runId);
 }
 
@@ -64,7 +72,34 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     config: Record<string, unknown>;
     serializedRuntimeInput: string;
   }> = [];
+  let executeOverride:
+    | ((ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>)
+    | null = null;
   const cleanupDirs = new Set<string>();
+
+  async function createLifecycleAgent(name: string) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name,
+      issuePrefix: `L${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name,
+      role: "engineer",
+      status: "idle",
+      adapterType: TEST_ADAPTER_TYPE,
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return agentId;
+  }
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-runtime-skills-");
@@ -80,6 +115,7 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     registerServerAdapter({
       type: TEST_ADAPTER_TYPE,
       execute: async (ctx) => {
+        if (executeOverride) return executeOverride(ctx);
         const serializedRuntimeInput = JSON.stringify({
           config: ctx.config,
           context: ctx.context,
@@ -107,12 +143,12 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
         testedAt: new Date().toISOString(),
       }),
     });
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     capturedRuns.length = 0;
+    executeOverride = null;
     await instanceSettingsService(db).updateExperimental({ enableBetaSkills: false });
-    await new Promise((resolve) => setTimeout(resolve, 100));
     await db.execute(sql.raw(`
       TRUNCATE TABLE
         "activity_log",
@@ -434,5 +470,43 @@ describeEmbeddedPostgres("heartbeat runtime skill version pins", () => {
     const log = await heartbeat.readLog(run!.id);
     expect(log.content).not.toContain(bearer);
     expect(log.content).not.toContain("pcgw_");
+  });
+
+  it("flushes a final unterminated stdout frame before successful finalization", async () => {
+    const frame = { type: "result", result: { status: "completed", value: "tail" } };
+    executeOverride = async (ctx) => {
+      await ctx.onLog("stdout", JSON.stringify(frame));
+      return { exitCode: 0, signal: null, timedOut: false };
+    };
+    const agentId = await createLifecycleAgent("Successful tail frame");
+    const heartbeat = heartbeatService(db);
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, run!.id))?.status).toBe("succeeded");
+
+    const log = await heartbeat.readLog(run!.id);
+    expect(log.content.trim().split("\n").map((line) => JSON.parse(line))).toContainEqual(
+      expect.objectContaining({ stream: "stdout", chunk: JSON.stringify(frame) }),
+    );
+  });
+
+  it("flushes a final unterminated stderr frame during error finalization", async () => {
+    const frame = { type: "error", error: { message: "adapter failed after tail" } };
+    executeOverride = async (ctx) => {
+      await ctx.onLog("stderr", JSON.stringify(frame));
+      throw new Error("adapter fixture failure");
+    };
+    const agentId = await createLifecycleAgent("Failed tail frame");
+    const heartbeat = heartbeatService(db);
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    expect((await waitForRunToFinish(heartbeat, run!.id))?.status).toBe("failed");
+
+    const log = await heartbeat.readLog(run!.id);
+    expect(log.content.trim().split("\n").map((line) => JSON.parse(line))).toContainEqual(
+      expect.objectContaining({ stream: "stderr", chunk: JSON.stringify(frame) }),
+    );
   });
 });
