@@ -706,7 +706,9 @@ describe("runChildProcess", () => {
         env: {},
         timeoutSec: 5,
         graceSec: 1,
-        onLog: async (stream, chunk) => logs.push({ stream, chunk }),
+        onLog: async (stream, chunk) => {
+          logs.push({ stream, chunk });
+        },
       },
     );
 

@@ -7,6 +7,7 @@ import {
   adapterExecutionTargetRemoteCwd,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetSessionMatches,
+  type AdapterManagedRuntimeAsset,
   describeAdapterExecutionTarget,
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
@@ -390,7 +391,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                     log: (line) => onLog("stdout", `${line}\n`),
                     env: process.env,
                   }).catch(() => undefined)),
-          }] : []),
+          } satisfies AdapterManagedRuntimeAsset] : []),
         ],
       });
       restoreRemoteWorkspace = () =>
