@@ -7899,6 +7899,30 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("does not immediately restart an issue after a board cancellation", async () => {
+    const { companyId, issueId, runId } = await seedRunFixture({
+      agentStatus: "idle",
+      includeIssue: true,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const cancelled = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+      suppressImmediateRecovery: true,
+      resultJson: {
+        cancelledByActorType: "user",
+        cancelledByUserId: "board-user",
+      },
+    });
+
+    expect(cancelled?.status).toBe("cancelled");
+    expect(
+      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)),
+    ).toHaveLength(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({ status: "in_progress", executionRunId: null });
+  });
+
   it("records operator interrupt cancellation metadata without changing terminal status", async () => {
     const { runId, issueId } = await seedRunFixture({
       agentStatus: "running",
