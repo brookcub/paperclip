@@ -685,6 +685,38 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it("decodes UTF-8 code points split across stdout and stderr data events", async () => {
+    const logs: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        [
+          "process.stdout.write(Buffer.from([0xf0,0x9f]));",
+          "process.stderr.write(Buffer.from([0xf0,0x9f]));",
+          "setTimeout(() => {",
+          "process.stdout.write(Buffer.from([0x98,0x80]));",
+          "process.stderr.write(Buffer.from([0x98,0x80]));",
+          "}, 100);",
+        ].join(""),
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async (stream, chunk) => logs.push({ stream, chunk }),
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("😀");
+    expect(result.stderr).toBe("😀");
+    expect(logs).toContainEqual({ stream: "stdout", chunk: "😀" });
+    expect(logs).toContainEqual({ stream: "stderr", chunk: "😀" });
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
