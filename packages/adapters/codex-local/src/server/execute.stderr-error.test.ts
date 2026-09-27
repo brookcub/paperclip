@@ -165,6 +165,59 @@ describe("codex_local stderr fallback error derivation", () => {
 
     expect(result.errorMessage).toBe("Codex exited with code 1");
   });
+
+  it("persists an explicit unavailable completion-evidence result when a timed-out attempt never reports thread.started", async () => {
+    runAdapterExecutionTargetProcess.mockResolvedValueOnce({
+      exitCode: null,
+      signal: "SIGTERM",
+      timedOut: true,
+      stdout: "",
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    });
+
+    const result = await execute(buildContext() as never);
+
+    expect(result).toMatchObject({
+      timedOut: true,
+      resultJson: {
+        completionEvidence: {
+          schema: "paperclip.codex-rollout-completion-evidence.v1",
+          status: "unavailable",
+          parseGaps: ["codex_run_session_not_observed"],
+        },
+      },
+    });
+  });
+
+  it("captures only the monitor attempt's observed thread ID", async () => {
+    const threadId = "019cabcd-1234-7abc-8def-0123456789ab";
+    runAdapterExecutionTargetProcess.mockImplementationOnce(async (...args: unknown[]) => {
+      const options = args[4] as {
+        onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+        onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+      };
+      await options.onSpawn?.({ pid: 999_999, processGroupId: null, startedAt: new Date().toISOString() });
+      const stdout = JSON.stringify({ type: "thread.started", thread_id: threadId }) + "\n";
+      await options.onLog?.("stdout", stdout);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { exitCode: null, signal: "SIGTERM", timedOut: false, stdout, stderr: "", pid: 999_999, startedAt: new Date().toISOString() };
+    });
+
+    const result = await execute(buildContext({ outputInactivityTimeoutMs: 1 }) as never);
+
+    expect(result).toMatchObject({
+      errorCode: "codex_output_inactivity_monitor",
+      resultJson: {
+        completionEvidence: {
+          sessionId: threadId,
+          status: "unavailable",
+          parseGaps: ["codex_sessions_dir_unavailable"],
+        },
+      },
+    });
+  });
 });
 
 describe("firstMeaningfulStderrLine", () => {

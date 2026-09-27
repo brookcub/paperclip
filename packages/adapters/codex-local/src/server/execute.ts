@@ -1392,6 +1392,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     };
 
+    const captureAttemptCompletionEvidence = (attemptSessionId: string | null) =>
+      captureCodexRolloutCompletionEvidence({
+        // A resumed runtime session is not proof this process started that session.
+        // Terminal early exits may use only the attempt's observed thread.started ID.
+        codexHome: executionTargetIsRemote ? null : effectiveCodexHome,
+        sessionId: attemptSessionId,
+        ...(executionTargetIsRemote
+          ? { unavailableReason: "remote_codex_rollout_unavailable" }
+          : !attemptSessionId
+          ? { unavailableReason: "codex_run_session_not_observed" }
+          : {}),
+      });
     const toResult = async (
       attempt: {
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
@@ -1406,6 +1418,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ): Promise<AdapterExecutionResult> => {
       if (attempt.monitor?.fired) {
         const errorMessage = formatOutputInactivityMonitorErrorMessage(attempt.monitor.elapsedMsSinceLastEvent);
+        const completionEvidence = await captureAttemptCompletionEvidence(attempt.parsed.sessionId);
         return {
           exitCode: null,
           signal: attempt.monitor.terminationSignal ?? attempt.proc.signal,
@@ -1426,6 +1439,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           resultJson: {
             stdout: attempt.proc.stdout,
             stderr: attempt.proc.stderr,
+            completionEvidence,
             outputInactivityMonitor: {
               kind: "output_inactivity",
               timeoutMs: attempt.monitor.timeoutMs,
@@ -1438,12 +1452,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
       if (attempt.proc.timedOut) {
+        const completionEvidence = await captureAttemptCompletionEvidence(attempt.parsed.sessionId);
         return {
           exitCode: attempt.proc.exitCode,
           signal: attempt.proc.signal,
           timedOut: true,
           errorMessage: `Timed out after ${timeoutSec}s`,
           clearSession: clearSessionOnMissingSession,
+          resultJson: { completionEvidence },
         };
       }
 
@@ -1517,13 +1533,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         authRefreshFailure ??
         (providerQuota ? "provider_quota" : transientUpstream || harnessCrash ? "transient_upstream" : null);
 
-      const completionEvidence = await captureCodexRolloutCompletionEvidence({
-        // The remote home is a staged copy and is deliberately removed after execution;
-        // do not read it or represent host-side sessions as remote-run evidence.
-        codexHome: executionTargetIsRemote ? null : effectiveCodexHome,
-        sessionId: resolvedSessionId,
-        ...(executionTargetIsRemote ? { unavailableReason: "remote_codex_rollout_unavailable" } : {}),
-      });
+      const completionEvidence = await captureAttemptCompletionEvidence(resolvedSessionId);
       return {
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
