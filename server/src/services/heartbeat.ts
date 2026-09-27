@@ -17167,6 +17167,18 @@ export function heartbeatService(
     }
     const config = parseObject(agent.adapterConfig);
     const preference = readPaperclipSkillSyncPreference(config);
+    // Read the selected skill authorities before the delivery resolver touches
+    // their local sources. A changed row between these reads is not a stable
+    // phase-A admission and remains unavailable for this run.
+    const configuredSkillKeys = Array.from(new Set(
+      preference.desiredSkillEntries.map((entry) => entry.key),
+    ));
+    const skillRowsBeforeMaterialization = configuredSkillKeys.length === 0
+      ? []
+      : await db
+        .select({ key: companySkillsTable.key, currentVersionId: companySkillsTable.currentVersionId, updatedAt: companySkillsTable.updatedAt })
+        .from(companySkillsTable)
+        .where(and(eq(companySkillsTable.companyId, agent.companyId), inArray(companySkillsTable.key, configuredSkillKeys)));
     const skillVersionPinsEnabled = (await instanceSettings.get()).experimental.enableBetaSkills === true;
     snapshot.skillVersionPinsEnabled = skillVersionPinsEnabled;
     // This is phase A: it uses the same delivery resolver as dispatch, before
@@ -17183,10 +17195,12 @@ export function heartbeatService(
       .where(and(eq(companySkillsTable.companyId, agent.companyId), inArray(companySkillsTable.key, desiredSkillKeys)));
     const verifiedSkillEntries = desiredSkillKeys.flatMap((key) => {
       const entry = entries.find((candidate) => candidate.key === key);
+      const before = skillRowsBeforeMaterialization.find((candidate) => candidate.key === key);
       const row = selectedSkillRows.find((candidate) => candidate.key === key);
-      return entry?.sourceStatus === "available"
-        && row
-        ? [{ key, versionId: entry.versionId ?? null, currentVersionId: row.currentVersionId, updatedAt: row.updatedAt.toISOString() }]
+      return entry?.sourceStatus === "available" && before && row &&
+        before.currentVersionId === row.currentVersionId &&
+        before.updatedAt.getTime() === row.updatedAt.getTime()
+        ? [{ key, versionId: entry.versionId ?? null, currentVersionId: before.currentVersionId, updatedAt: before.updatedAt.toISOString() }]
         : [];
     });
     const selected = verifiedSkillEntries.map((entry) => entry.key);
@@ -17238,7 +17252,7 @@ export function heartbeatService(
       )).then((keys) => keys.filter((key): key is string => key !== null)),
       snapshot.skillRevisions.length === 0
         ? Promise.resolve([])
-        : tx.select({ id: companySkillsTable.id, key: companySkillsTable.key, currentVersionId: companySkillsTable.currentVersionId })
+        : tx.select({ id: companySkillsTable.id, key: companySkillsTable.key, currentVersionId: companySkillsTable.currentVersionId, updatedAt: companySkillsTable.updatedAt })
           .from(companySkillsTable)
           .where(and(eq(companySkillsTable.companyId, run.companyId), inArray(companySkillsTable.key, snapshot.skillRevisions.map((skill) => skill.key)))),
       snapshot.skillRevisions.length === 0
