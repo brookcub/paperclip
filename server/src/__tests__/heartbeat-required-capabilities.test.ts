@@ -10,6 +10,7 @@ import {
   companyMemberships,
   companySkills,
   createDb,
+  environments,
   heartbeatRuns,
   issueComments,
   issues,
@@ -17,6 +18,7 @@ import {
 } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { PAPERCLIP_OPERATIONAL_SKILL_KEY } from "@paperclipai/adapter-utils/server-utils";
 
 const execute = vi.hoisted(() => vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "capability test", provider: "test", model: "test" })));
 vi.mock("../adapters/index.js", async () => ({
@@ -46,6 +48,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     await db.delete(companyMemberships);
     await db.delete(companySkills);
     await db.delete(agents);
+    await db.delete(environments);
     await db.delete(companies);
   });
 
@@ -54,6 +57,13 @@ describeEmbedded("heartbeat required capability admission", () => {
     const agentId = randomUUID();
     const issueId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Capability test", issuePrefix: "CAP", requireBoardApprovalForNewAgents: false });
+    await db.insert(environments).values({
+      name: `Capability local ${companyId}`,
+      driver: "local",
+      status: "active",
+      config: {},
+      envVars: {},
+    });
     await db.insert(agents).values({
       id: agentId, companyId, name: "Runner", role: "engineer", status: "active", adapterType: "codex_local",
       adapterConfig, runtimeConfig: { heartbeat: { wakeOnDemand: true } }, permissions: {},
@@ -79,8 +89,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     });
   }
 
-  async function installSelectedLocalSkill(companyId: string) {
-    const key = `company/${companyId}/required-skill`;
+  async function installSelectedLocalSkill(companyId: string, key = `company/${companyId}/required-skill`) {
     const source = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-required-skill-"));
     await fs.writeFile(path.join(source, "SKILL.md"), "# Required skill\n", "utf8");
     await db.insert(companySkills).values({
@@ -175,6 +184,41 @@ describeEmbedded("heartbeat required capability admission", () => {
     }
   });
 
+  it("admits the legacy default core skill when it is available", async () => {
+    const { companyId, agentId, issueId } = await seed({
+      requiredCapabilities: { version: 1, items: [{ kind: "skill", key: PAPERCLIP_OPERATIONAL_SKILL_KEY }] },
+    });
+    const { source } = await installSelectedLocalSkill(companyId, PAPERCLIP_OPERATIONAL_SKILL_KEY);
+    try {
+      const heartbeat = heartbeatService(db);
+      const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+      if (run) await heartbeat.waitForRunExecutionDrain(run.id);
+      expect(execute).toHaveBeenCalled();
+    } finally {
+      await fs.rm(source, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a Codex CLI capability on a selected remote target", async () => {
+    const policy = { requiredCapabilities: { version: 1, items: [
+      { kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" },
+    ] } };
+    const { companyId, agentId, issueId } = await seed(policy);
+    const [remote] = await db.insert(environments).values({
+      name: `Capability remote ${companyId}`,
+      driver: "sandbox",
+      status: "active",
+      config: {},
+      envVars: {},
+    }).returning();
+    await db.update(agents).set({ defaultEnvironmentId: remote!.id }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(run).toMatchObject({ status: "cancelled", startedAt: null, errorCode: "required_capabilities_unavailable" });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it("does not start when requirements appear after a legacy phase-A read", async () => {
     const { companyId, agentId, issueId } = await seed({});
     let changed = false;
@@ -202,6 +246,24 @@ describeEmbedded("heartbeat required capability admission", () => {
         if (stage !== "claim" || changed) return;
         changed = true;
         await db.update(agents).set({ adapterConfig: { engine: "cli", disable: "shell_tool" } }).where(eq(agents.id, agentId));
+      },
+    });
+    await wakeAutomation(heartbeat, agentId, issueId);
+    await expectUnstarted(companyId);
+  });
+
+  it("does not start when the selected target changes after phase A", async () => {
+    const policy = { requiredCapabilities: { version: 1, items: [
+      { kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" },
+    ] } };
+    const { companyId, agentId, issueId } = await seed(policy);
+    const [local] = await db.select().from(environments).where(eq(environments.driver, "local"));
+    let changed = false;
+    const heartbeat = heartbeatService(db, {
+      beforeChatControlRecoveryCheck: async ({ stage }) => {
+        if (stage !== "claim" || changed) return;
+        changed = true;
+        await db.update(environments).set({ driver: "sandbox" }).where(eq(environments.id, local!.id));
       },
     });
     await wakeAutomation(heartbeat, agentId, issueId);

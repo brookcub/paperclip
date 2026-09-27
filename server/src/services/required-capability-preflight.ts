@@ -26,6 +26,7 @@ export type CapabilityPreflightSnapshot = {
   permissionKeys: string[];
   allowedAgentPermissionKeys: string[];
   managedMcpRevision: string;
+  executionTargetRevision: string;
   skillRevisions: Array<{ key: string; versionId: string | null; currentVersionId: string | null; updatedAt: string }>;
   skillVersionPinsEnabled: boolean | null;
 };
@@ -60,6 +61,7 @@ export function capabilityPreflightSnapshotIsCurrent(
     snapshot.allowedAgentPermissionKeys.length === current.allowedAgentPermissionKeys.length &&
     snapshot.allowedAgentPermissionKeys.every((key, index) => key === current.allowedAgentPermissionKeys[index]) &&
     snapshot.managedMcpRevision === current.managedMcpRevision &&
+    snapshot.executionTargetRevision === current.executionTargetRevision &&
     (snapshot.skillVersionPinsEnabled === null || snapshot.skillVersionPinsEnabled === current.skillVersionPinsEnabled) &&
     stableCapabilitySnapshot(snapshot.skillRevisions) === stableCapabilitySnapshot(current.skillRevisions);
 }
@@ -110,7 +112,7 @@ export function evaluateRequiredCapabilities(input: {
   adapterType: string;
   adapterConfig: Record<string, unknown>;
   agentId: string;
-  targetIsRemote: boolean;
+  targetIsRemote: boolean | null;
   selectedSkillKeys: Iterable<string>;
   skillSelectionsVerified: boolean;
   unverifiedSkillKeys?: Iterable<string>;
@@ -137,7 +139,7 @@ export function evaluateRequiredCapabilities(input: {
     }
     if (requirement.kind === "skill") {
       if (!skills.has(requirement.key) && unverifiedSkills.has(requirement.key)) {
-        unmet.push({ id, state: "unknown", reason: "skill_version_not_pinned" });
+        unmet.push({ id, state: "unknown", reason: "skill_source_unavailable" });
       } else if (!skills.has(requirement.key)) unmet.push({ id, state: "missing", reason: "skill_not_selected" });
       else if (!input.skillSelectionsVerified) unmet.push({ id, state: "unknown", reason: "skill_revision_not_rechecked" });
       continue;
@@ -151,6 +153,14 @@ export function evaluateRequiredCapabilities(input: {
       else if (requirement.authorization === "must_not_prompt") {
         unmet.push({ id, state: "missing", reason: "unprompted_authorization_required" });
       } else admittedPolicy.push({ id, authorization: "conditional" });
+      continue;
+    }
+    if (input.targetIsRemote === null) {
+      unmet.push({ id, state: "unknown", reason: "execution_target_unresolved" });
+      continue;
+    }
+    if (input.targetIsRemote && requirement.runtime === "codex_cli") {
+      unmet.push({ id, state: "unknown", reason: "remote_codex_policy_unqualified" });
       continue;
     }
     const policy = requirement.runtime === "claude_cli"

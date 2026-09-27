@@ -557,13 +557,14 @@ import {
 } from "@paperclipai/adapter-utils";
 import {
   readPaperclipSkillSyncPreference,
+  PAPERCLIP_OPERATIONAL_SKILL_KEY,
   resolveLegacyPaperclipDesiredSkillNames,
   selectPaperclipTaskMarkdown,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   writePaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
-import { extractSkillMentionIds, isUuidLike } from "@paperclipai/shared";
+import { extractSkillMentionIds, isUuidLike, type InstanceSettings } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import { environmentService } from "./environments.js";
 import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.js";
@@ -17067,6 +17068,78 @@ export function heartbeatService(
     }
   }
 
+  async function resolveCapabilityPreflightExecutionTarget(input: {
+    readDb: Db;
+    agentDefaultEnvironmentId: string | null;
+    settings: InstanceSettings;
+  }): Promise<{ targetIsRemote: boolean | null; revision: string }> {
+    const environments = environmentService(input.readDb);
+    const local = (await environments.list({
+      driver: "local",
+      status: "active",
+    }))[0] ?? null;
+    const base = {
+      agentDefaultEnvironmentId: input.agentDefaultEnvironmentId,
+      instanceDefaultEnvironmentId: input.settings.defaultEnvironmentId,
+      instanceSettingsUpdatedAt: input.settings.updatedAt.toISOString(),
+      executionMode: input.settings.general.executionMode,
+      managedSandboxOnly:
+        input.settings.experimental.enableManagedSandboxOnly === true,
+      localEnvironment: local
+        ? [local.id, local.driver, local.updatedAt.toISOString()]
+        : null,
+    };
+    if (!local) {
+      return {
+        targetIsRemote: null,
+        revision: stableCapabilitySnapshot({ ...base, selectedEnvironment: null }),
+      };
+    }
+
+    let selected: Awaited<ReturnType<typeof environments.getById>> = null;
+    if (isExecutionForcedToKubernetes({
+      executionMode: input.settings.general.executionMode,
+    })) {
+      selected = await environments.findKubernetesEnvironment();
+    } else {
+      const managed = input.settings.experimental.enableManagedSandboxOnly === true
+        ? await environments.findManagedSandboxEnvironment()
+        : null;
+      try {
+        const resolution = resolveExecutionWorkspaceEnvironmentId({
+          agentDefaultEnvironmentId: input.agentDefaultEnvironmentId,
+          instanceDefaultEnvironmentId: input.settings.defaultEnvironmentId,
+          localDefaultEnvironmentId: local.id,
+          managedSandboxOnly:
+            input.settings.experimental.enableManagedSandboxOnly === true,
+          managedSandboxEnvironmentId: managed?.id ?? null,
+        });
+        selected = resolution.environmentId === local.id
+          ? local
+          : await environments.getById(resolution.environmentId);
+      } catch {
+        selected = null;
+      }
+    }
+    const revision = stableCapabilitySnapshot({
+      ...base,
+      selectedEnvironment: selected
+        ? [selected.id, selected.driver, selected.updatedAt.toISOString()]
+        : null,
+    });
+    if (!selected || selected.status !== "active") {
+      return { targetIsRemote: null, revision };
+    }
+    return {
+      targetIsRemote: selected.driver === "local"
+        ? false
+        : isRemoteExecutionEnvironmentDriver(selected.driver)
+          ? true
+          : null,
+      revision,
+    };
+  }
+
   async function preflightQueuedRunCapabilities(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -17086,7 +17159,7 @@ export function heartbeatService(
     if (!issue) {
       return {
         result: { admitted: false, requirements: [], unmet: [{ id: `issue:${issueId}`, state: "missing" as const, reason: "issue_missing" }], admittedPolicy: [] },
-        snapshot: { issueId, agentId: agent.id, issueUpdatedAt: "missing", executionPolicy: "null", agentUpdatedAt: agent.updatedAt.toISOString(), adapterType: agent.adapterType, adapterConfig: stableCapabilitySnapshot(agent.adapterConfig), permissionKeys: [], allowedAgentPermissionKeys: [], managedMcpRevision: "", skillRevisions: [], skillVersionPinsEnabled: false },
+        snapshot: { issueId, agentId: agent.id, issueUpdatedAt: "missing", executionPolicy: "null", agentUpdatedAt: agent.updatedAt.toISOString(), adapterType: agent.adapterType, adapterConfig: stableCapabilitySnapshot(agent.adapterConfig), permissionKeys: [], allowedAgentPermissionKeys: [], managedMcpRevision: "", executionTargetRevision: "", skillRevisions: [], skillVersionPinsEnabled: false },
       };
     }
     const requirements = readRequiredCapabilities(issue?.executionPolicy);
@@ -17104,6 +17177,7 @@ export function heartbeatService(
           permissionKeys: [],
           allowedAgentPermissionKeys: [],
           managedMcpRevision: "",
+          executionTargetRevision: "",
           skillRevisions: [],
           skillVersionPinsEnabled: null,
         },
@@ -17143,6 +17217,7 @@ export function heartbeatService(
         entries: tools.entries.map((entry) => [entry.id, entry.updatedAt.toISOString()]).sort(),
         bindings: tools.bindings.map((binding) => [binding.id, binding.updatedAt.toISOString()]).sort(),
       }),
+      executionTargetRevision: "",
       skillRevisions: [],
       skillVersionPinsEnabled: null,
     };
@@ -17166,20 +17241,28 @@ export function heartbeatService(
       };
     }
     const config = parseObject(agent.adapterConfig);
+    const currentInstanceSettings = await instanceSettings.get();
+    const executionTarget = await resolveCapabilityPreflightExecutionTarget({
+      readDb: db,
+      agentDefaultEnvironmentId: agent.defaultEnvironmentId,
+      settings: currentInstanceSettings,
+    });
+    snapshot.executionTargetRevision = executionTarget.revision;
     const preference = readPaperclipSkillSyncPreference(config);
     // Read the selected skill authorities before the delivery resolver touches
     // their local sources. A changed row between these reads is not a stable
     // phase-A admission and remains unavailable for this run.
-    const configuredSkillKeys = Array.from(new Set(
-      preference.desiredSkillEntries.map((entry) => entry.key),
-    ));
+    const configuredSkillKeys = Array.from(new Set([
+      PAPERCLIP_OPERATIONAL_SKILL_KEY,
+      ...preference.desiredSkillEntries.map((entry) => entry.key),
+    ]));
     const skillRowsBeforeMaterialization = configuredSkillKeys.length === 0
       ? []
       : await db
         .select({ key: companySkillsTable.key, currentVersionId: companySkillsTable.currentVersionId, updatedAt: companySkillsTable.updatedAt })
         .from(companySkillsTable)
         .where(and(eq(companySkillsTable.companyId, agent.companyId), inArray(companySkillsTable.key, configuredSkillKeys)));
-    const skillVersionPinsEnabled = (await instanceSettings.get()).experimental.enableBetaSkills === true;
+    const skillVersionPinsEnabled = currentInstanceSettings.experimental.enableBetaSkills === true;
     snapshot.skillVersionPinsEnabled = skillVersionPinsEnabled;
     // This is phase A: it uses the same delivery resolver as dispatch, before
     // any run-start mutation. Materialization is deliberately outside locks.
@@ -17212,7 +17295,7 @@ export function heartbeatService(
       adapterType: agent.adapterType,
       adapterConfig: config,
       agentId: agent.id,
-      targetIsRemote: false,
+      targetIsRemote: executionTarget.targetIsRemote,
       selectedSkillKeys: selected,
       skillSelectionsVerified: true,
       unverifiedSkillKeys,
@@ -17236,7 +17319,7 @@ export function heartbeatService(
         .where(and(eq(issues.id, snapshot.issueId), eq(issues.companyId, run.companyId)))
         .limit(1)
         .then((rows) => rows[0] ?? null),
-      tx.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig, updatedAt: agents.updatedAt })
+      tx.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig, defaultEnvironmentId: agents.defaultEnvironmentId, updatedAt: agents.updatedAt })
         .from(agents)
         .where(and(eq(agents.id, agent.id), eq(agents.companyId, run.companyId)))
         .limit(1)
@@ -17263,6 +17346,11 @@ export function heartbeatService(
       instanceSettingsService(tx).get(),
     ]);
     if (!issue || !currentAgent) return false;
+    const executionTarget = await resolveCapabilityPreflightExecutionTarget({
+      readDb: tx,
+      agentDefaultEnvironmentId: currentAgent.defaultEnvironmentId,
+      settings: currentInstanceSettings,
+    });
     if (snapshot.skillRevisions.some((skill) => {
       const row = skillRows.find((candidate) => candidate.key === skill.key);
       return !row || row.currentVersionId !== skill.currentVersionId || row.updatedAt.toISOString() !== skill.updatedAt ||
@@ -17284,6 +17372,7 @@ export function heartbeatService(
         entries: tools.entries.map((entry) => [entry.id, entry.updatedAt.toISOString()]).sort(),
         bindings: tools.bindings.map((binding) => [binding.id, binding.updatedAt.toISOString()]).sort(),
       }),
+      executionTargetRevision: executionTarget.revision,
       skillRevisions: snapshot.skillRevisions,
       skillVersionPinsEnabled: currentInstanceSettings.experimental.enableBetaSkills === true,
     });
