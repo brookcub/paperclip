@@ -1954,6 +1954,7 @@ export {
   updateIssueSchema,
   stalledReviewDecisionSchema,
   issueExecutionPolicySchema,
+  requiredCapabilitiesSchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
   issueReviewRequestSchema,
