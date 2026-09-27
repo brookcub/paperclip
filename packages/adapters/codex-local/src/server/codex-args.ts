@@ -15,6 +15,12 @@ export type BuildCodexExecArgsResult = {
   fastModeIgnoredReason: string | null;
 };
 
+export type CodexShellPolicy = {
+  present: boolean;
+  authorization: "unprompted" | "conditional" | "unknown";
+  reason: string;
+};
+
 function readExtraArgs(config: unknown): string[] {
   const fromExtraArgs = asStringArray(asRecord(config).extraArgs);
   if (fromExtraArgs.length > 0) return fromExtraArgs;
@@ -25,6 +31,24 @@ function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+/** The CLI shell capability and its prompt policy, without claiming approval for a particular command. */
+export function resolveCodexShellPolicy(config: unknown): CodexShellPolicy {
+  const record = asRecord(config);
+  if (asString(record.engine, "").trim() !== "cli") {
+    return { present: false, authorization: "unknown", reason: "codex_cli_engine_not_selected" };
+  }
+  const extraArgs = readExtraArgs(record);
+  if (extraArgs.some((arg) => /^(--profile|-p|--config|-c)(?:=|$)/.test(arg))) {
+    return { present: true, authorization: "unknown", reason: "custom_config_override" };
+  }
+  const bypass = asBoolean(record.dangerouslyBypassApprovalsAndSandbox,
+    asBoolean(record.dangerouslyBypassSandbox, false));
+  if (bypass || extraArgs.includes("--dangerously-bypass-approvals-and-sandbox")) {
+    return { present: true, authorization: "unprompted", reason: "dangerously_bypass_approvals_and_sandbox" };
+  }
+  return { present: true, authorization: "conditional", reason: "codex_approval_policy" };
 }
 
 function formatFastModeSupportedModels(): string {

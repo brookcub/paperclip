@@ -429,6 +429,7 @@ export {
   issueBlockedInboxStateSchema,
   updateIssueSchema,
   stalledReviewDecisionSchema,
+  requiredCapabilitiesSchema,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   issueRecoveryActionReadModelSchema,

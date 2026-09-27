@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { buildCodexExecArgs } from "./codex-args.js";
+import { buildCodexExecArgs, resolveCodexShellPolicy } from "./codex-args.js";
 
 describe("buildCodexExecArgs", () => {
+  it("reports the selected CLI shell as conditional and custom config as unknown", () => {
+    expect(resolveCodexShellPolicy({ engine: "cli" })).toMatchObject({ present: true, authorization: "conditional" });
+    expect(resolveCodexShellPolicy({ engine: "cli", extraArgs: ["--profile", "operator"] })).toMatchObject({ present: true, authorization: "unknown" });
+    expect(resolveCodexShellPolicy({ engine: "acp" })).toMatchObject({ present: false, authorization: "unknown" });
+  });
+
   it("forwards GPT-6 Astra, its ultra reasoning effort, and fast mode", () => {
     const result = buildCodexExecArgs({
       model: "gpt-6-astra",

@@ -151,6 +151,7 @@ import {
   toolConnections,
   toolProfileEntries,
   toolProfiles,
+  principalPermissionGrants,
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
@@ -431,6 +432,7 @@ import {
   isRuntimeOwnedGitBranch,
 } from "./execution-workspace-branch-ownership.js";
 import {
+  capabilityRequirementId,
   cleanupHeartbeatRunScratch,
   prepareHeartbeatRunScratchForExecution,
   type HeartbeatRunScratch,
@@ -556,6 +558,7 @@ import {
 } from "@paperclipai/adapter-utils";
 import {
   readPaperclipSkillSyncPreference,
+  resolveLegacyPaperclipDesiredSkillNames,
   selectPaperclipTaskMarkdown,
   UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
@@ -571,6 +574,14 @@ import {
   type ProviderResourceDisposition,
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
+import {
+  capabilityPreflightSnapshotIsCurrent,
+  evaluateRequiredCapabilities,
+  readRequiredCapabilities,
+  stableCapabilitySnapshot,
+  type CapabilityPreflight,
+  type CapabilityPreflightSnapshot,
+} from "./required-capability-preflight.js";
 import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
@@ -17056,6 +17067,126 @@ export function heartbeatService(
     }
   }
 
+  async function preflightQueuedRunCapabilities(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    issueId: string | null,
+  ): Promise<CapabilityPreflight | null> {
+    if (!issueId) return null;
+    const issue = await db
+      .select({
+        executionPolicy: issues.executionPolicy,
+        updatedAt: issues.updatedAt,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    const requirements = readRequiredCapabilities(issue?.executionPolicy);
+    if (requirements.length === 0) return null;
+    const [grants, tools, runScopedSkillKeys] = await Promise.all([
+      db.select({ permissionKey: principalPermissionGrants.permissionKey })
+        .from(principalPermissionGrants)
+        .where(and(
+          eq(principalPermissionGrants.companyId, agent.companyId),
+          eq(principalPermissionGrants.principalType, "agent"),
+          eq(principalPermissionGrants.principalId, agent.id),
+        )),
+      toolAccessService(db).getEffectiveProfilesForAgent(agent.companyId, agent.id),
+      resolveRunScopedMentionedSkillKeys({ db, companyId: agent.companyId, issueId }),
+    ]);
+    const snapshot: CapabilityPreflightSnapshot = {
+      issueId,
+      issueUpdatedAt: issue!.updatedAt.toISOString(),
+      executionPolicy: stableCapabilitySnapshot(issue!.executionPolicy),
+      agentUpdatedAt: agent.updatedAt.toISOString(),
+      adapterType: agent.adapterType,
+      adapterConfig: stableCapabilitySnapshot(agent.adapterConfig),
+      agentPermissionKeys: grants.map((grant) => grant.permissionKey).sort(),
+    };
+    // Dispatch applies an issue override and mention-scoped keys later. Do not
+    // certify the agent default when either would change that effective input.
+    if ((issue!.assigneeAgentId === agent.id &&
+      parseIssueAssigneeAdapterOverrides(issue!.assigneeAdapterOverrides)?.adapterConfig) ||
+      runScopedSkillKeys.length > 0) {
+      return {
+        result: {
+          admitted: false,
+          requirements,
+          unmet: requirements.map((requirement) => ({
+            id: capabilityRequirementId(requirement),
+            state: "unknown" as const,
+            reason: "effective_dispatch_config_requires_resolution",
+          })),
+          admittedPolicy: [],
+        },
+        snapshot,
+      };
+    }
+    const config = parseObject(agent.adapterConfig);
+    const preference = readPaperclipSkillSyncPreference(config);
+    // This is phase A: it uses the same delivery resolver as dispatch, before
+    // any run-start mutation. Materialization is deliberately outside locks.
+    const entries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
+      versionSelections: skillVersionSelectionMap(preference.desiredSkillEntries, {
+        versionPinsEnabled: false,
+      }),
+    });
+    const selected = resolveLegacyPaperclipDesiredSkillNames(config, entries)
+      .filter((key) => entries.some((entry) => entry.key === key && entry.sourceStatus === "available"));
+    return {
+      result: evaluateRequiredCapabilities({
+      requirements,
+      adapterType: agent.adapterType,
+      adapterConfig: config,
+      targetIsRemote: false,
+      selectedSkillKeys: selected,
+      agentPermissionKeys: grants.map((grant) => grant.permissionKey),
+      managedMcpToolNames: tools.allowedToolNames,
+      }),
+      snapshot,
+    };
+  }
+
+  async function capabilityPreflightStillCurrent(
+    tx: Db,
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    snapshot: CapabilityPreflightSnapshot | null,
+  ): Promise<boolean> {
+    if (!snapshot) return true;
+    const [issue, currentAgent, grants] = await Promise.all([
+      tx.select({ executionPolicy: issues.executionPolicy, updatedAt: issues.updatedAt })
+        .from(issues)
+        .where(and(eq(issues.id, snapshot.issueId), eq(issues.companyId, run.companyId)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      tx.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig, updatedAt: agents.updatedAt })
+        .from(agents)
+        .where(and(eq(agents.id, agent.id), eq(agents.companyId, run.companyId)))
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      tx.select({ permissionKey: principalPermissionGrants.permissionKey })
+        .from(principalPermissionGrants)
+        .where(and(
+          eq(principalPermissionGrants.companyId, run.companyId),
+          eq(principalPermissionGrants.principalType, "agent"),
+          eq(principalPermissionGrants.principalId, agent.id),
+        )),
+    ]);
+    if (!issue || !currentAgent) return false;
+    return capabilityPreflightSnapshotIsCurrent(snapshot, {
+      issueId: snapshot.issueId,
+      issueUpdatedAt: issue.updatedAt.toISOString(),
+      executionPolicy: stableCapabilitySnapshot(issue.executionPolicy),
+      agentUpdatedAt: currentAgent.updatedAt.toISOString(),
+      adapterType: currentAgent.adapterType,
+      adapterConfig: stableCapabilitySnapshot(currentAgent.adapterConfig),
+      agentPermissionKeys: grants.map((grant) => grant.permissionKey).sort(),
+    });
+  }
+
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
@@ -17192,6 +17323,33 @@ export function heartbeatService(
         );
         return null;
       }
+    }
+
+    const capabilityPreflight = await preflightQueuedRunCapabilities(
+      run,
+      agent,
+      issueId,
+    );
+    if (capabilityPreflight && !capabilityPreflight.result.admitted) {
+      const unmet = capabilityPreflight.result.unmet
+        .map((item) => `${item.id} (${item.state}: ${item.reason})`)
+        .join(", ");
+      const reason = `Cancelled before run start because required capabilities are unavailable: ${unmet}`;
+      await cancelRunInternal(run.id, reason, {
+        errorCode: "required_capabilities_unavailable",
+        resultJson: { requiredCapabilities: capabilityPreflight.result },
+      });
+      const cancelled = await getRun(run.id);
+      if (cancelled) {
+        await appendRunEvent(cancelled, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message: reason,
+          payload: { requiredCapabilities: capabilityPreflight.result },
+        });
+      }
+      return null;
     }
 
     const claimedAt = new Date();
@@ -17369,6 +17527,12 @@ export function heartbeatService(
                 // envelope. Preserve their established claim path; only an
                 // explicitly bound queued-message envelope is subject to the
                 // live-comment discard gate below.
+                if (!await capabilityPreflightStillCurrent(
+                  tx as unknown as Db,
+                  run,
+                  agent,
+                  capabilityPreflight?.snapshot ?? null,
+                )) return { kind: "stale" as const, run: null };
                 const [claimedRun] = await tx
                   .update(heartbeatRuns)
                   .set({
@@ -17455,6 +17619,13 @@ export function heartbeatService(
                 };
               }
 
+              if (!await capabilityPreflightStillCurrent(
+                tx as unknown as Db,
+                run,
+                agent,
+                capabilityPreflight?.snapshot ?? null,
+              )) return { kind: "stale" as const, run: null };
+
               await tx
                 .update(agentWakeupRequests)
                 .set({
@@ -17534,8 +17705,14 @@ export function heartbeatService(
     }
     const claimed = queuedCommentClaim
       ? queuedCommentClaim.run
-      : await withChatControlRecoveryGate(run, "claim", async (tx) =>
-          tx
+      : await withChatControlRecoveryGate(run, "claim", async (tx) => {
+          if (!await capabilityPreflightStillCurrent(
+            tx,
+            run,
+            agent,
+            capabilityPreflight?.snapshot ?? null,
+          )) return null;
+          return tx
             .update(heartbeatRuns)
             .set({
               status: "running",
@@ -17552,8 +17729,8 @@ export function heartbeatService(
               ),
             )
             .returning()
-            .then((rows) => rows[0] ?? null),
-        );
+            .then((rows) => rows[0] ?? null);
+        });
     if (!claimed) return null;
 
     publishLiveEvent({

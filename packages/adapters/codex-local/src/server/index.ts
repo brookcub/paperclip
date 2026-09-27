@@ -10,6 +10,7 @@ export {
 } from "./auth-precedence.js";
 export * from "./acp.js";
 export { getConfigSchema } from "./config-schema.js";
+export { resolveCodexShellPolicy, type CodexShellPolicy } from "./codex-args.js";
 export {
   reconcileManagedCodexHome,
   isManagedCodexHomePath,

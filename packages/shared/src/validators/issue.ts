@@ -22,6 +22,7 @@ import {
   ISSUE_RECOVERY_ACTION_STATUSES,
   ISSUE_REVIEW_POLICIES,
   ISSUE_WORK_MODES,
+  PERMISSION_KEYS,
   clampIssueRequestDepth,
   ISSUE_STATUSES,
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
@@ -431,6 +432,28 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .default(null),
 });
 
+const requiredCapabilitySchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("skill"),
+    key: z.string().trim().min(1).max(200),
+  }).strict(),
+  z.object({
+    kind: z.literal("tool"),
+    runtime: z.enum(["claude_cli", "codex_cli", "paperclip_mcp"]),
+    name: z.string().trim().min(1).max(128),
+    authorization: z.enum(["conditional_ok", "must_not_prompt"]),
+  }).strict(),
+  z.object({
+    kind: z.literal("permission"),
+    key: z.enum(PERMISSION_KEYS),
+  }).strict(),
+]);
+
+export const requiredCapabilitiesSchema = z.object({
+  version: z.literal(1),
+  items: z.array(requiredCapabilitySchema).min(1).max(50),
+}).strict();
+
 export const issueExecutionPolicySchema = z.object({
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
@@ -446,6 +469,7 @@ export const issueExecutionPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+  requiredCapabilities: requiredCapabilitiesSchema.optional().nullable(),
 });
 
 export const issueExecutionMonitorStateSchema = z.object({
