@@ -290,10 +290,13 @@ describe("run completion evidence", () => {
         completionEvidence: {
           ...transcript,
           status: "available",
-          files: Array.from({ length: 51 }, (_, index) => ({
-            ...transcript.files[0],
-            fileName: `agent-${index}.jsonl`,
-          })),
+          files: [
+            transcript.files[0],
+            ...Array.from({ length: 50 }, (_, index) => ({
+              ...transcript.files[0],
+              fileName: `agent-${index}.jsonl`,
+            })),
+          ],
         },
       },
       providerTrace: null,
