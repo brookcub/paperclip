@@ -325,16 +325,18 @@ describeEmbedded("heartbeat required capability admission", () => {
         if (timer) clearTimeout(timer);
       }
     }
-    let releaseFirstLock = () => {};
+    let releaseFirstLock!: () => void;
+    const firstLockGate = new Promise<void>((resolve) => { releaseFirstLock = resolve; });
     let firstLockEntered!: () => void;
     const firstLockEnteredPromise = new Promise<void>((resolve) => { firstLockEntered = resolve; });
-    let releaseSecondLock = () => {};
+    let releaseSecondLock!: () => void;
+    const secondLockGate = new Promise<void>((resolve) => { releaseSecondLock = resolve; });
     let secondLock: Promise<void> | null = null;
     let resumer: Promise<void> | null = null;
     const heartbeat = heartbeatService(db);
     const firstLock = withAgentStartLock(agentId, async () => {
       firstLockEntered();
-      await new Promise<void>((resolve) => { releaseFirstLock = resolve; });
+      await firstLockGate;
     });
 
     try {
@@ -348,7 +350,7 @@ describeEmbedded("heartbeat required capability admission", () => {
       await awaitStage("resume queue lock", resumeLockQueuedPromise);
       agentStartLockProbe.onQueued = null;
       secondLock = withAgentStartLock(agentId, async () => {
-        await new Promise<void>((resolve) => { releaseSecondLock = resolve; });
+        await secondLockGate;
       });
       releaseFirstLock();
       await awaitStage("resume queued runs", resumer);
