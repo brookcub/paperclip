@@ -3489,18 +3489,123 @@ function redactInlineBase64ImageData(chunk: string) {
   );
 }
 
+function truncateRunLogChunk(chunk: string, maxChars: number) {
+  if (chunk.length <= maxChars) return chunk;
+
+  const headChars = Math.max(0, Math.floor(maxChars * 0.6));
+  const tailChars = Math.max(0, Math.floor(maxChars * 0.25));
+  const omittedChars = Math.max(0, chunk.length - headChars - tailChars);
+  const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
+  return `${chunk.slice(0, headChars)}${marker}${chunk.slice(chunk.length - tailChars)}`;
+}
+
 export function compactRunLogChunk(
   chunk: string,
   maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
 ) {
   const normalized = redactSensitiveText(redactInlineBase64ImageData(chunk));
-  if (normalized.length <= maxChars) return normalized;
+  return truncateRunLogChunk(normalized, maxChars);
+}
 
-  const headChars = Math.max(0, Math.floor(maxChars * 0.6));
-  const tailChars = Math.max(0, Math.floor(maxChars * 0.25));
-  const omittedChars = Math.max(0, normalized.length - headChars - tailChars);
-  const marker = `\n[paperclip truncated run log chunk: omitted ${omittedChars} chars]\n`;
-  return `${normalized.slice(0, headChars)}${marker}${normalized.slice(normalized.length - tailChars)}`;
+function compactStructuredRunLogChunk(
+  chunk: string,
+  maxChars: number,
+) {
+  return truncateRunLogChunk(redactInlineBase64ImageData(chunk), maxChars);
+}
+
+type RunLogStream = "stdout" | "stderr";
+
+type RunLogStreamState = {
+  buffered: string;
+  discarding: boolean;
+};
+
+export function createRunLogChunkNormalizer({
+  currentUserRedactionOptions,
+  maxLineChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
+}: {
+  currentUserRedactionOptions: CurrentUserRedactionOptions;
+  maxLineChars?: number;
+}) {
+  const states: Record<RunLogStream, RunLogStreamState> = {
+    stdout: { buffered: "", discarding: false },
+    stderr: { buffered: "", discarding: false },
+  };
+  const unavailableLineMarker =
+    `[paperclip unavailable run-log line: exceeded ${maxLineChars} chars; discarded through next newline]\n`;
+
+  const normalizeLine = (line: string) => {
+    const currentUserRedacted = redactCurrentUserText(
+      line,
+      currentUserRedactionOptions,
+    );
+    try {
+      const parsed: unknown = JSON.parse(currentUserRedacted);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        // The payload is already structurally redacted. Do not route this
+        // serialized JSON back through the raw credential scanner: its
+        // fail-closed handling of malformed text can consume JSON syntax.
+        return compactStructuredRunLogChunk(
+          JSON.stringify(redactEventPayload(parsed as Record<string, unknown>)),
+          maxLineChars,
+        );
+      }
+    } catch {
+      // Provider output is not required to be JSON. Keep malformed text on
+      // the existing fail-closed scanner.
+    }
+    return compactRunLogChunk(currentUserRedacted, maxLineChars);
+  };
+
+  const consume = (stream: RunLogStream, chunk: string, flush: boolean) => {
+    const state = states[stream];
+    state.buffered += chunk;
+    const normalized: string[] = [];
+
+    while (state.buffered.length > 0) {
+      if (state.discarding) {
+        const newline = state.buffered.indexOf("\n");
+        if (newline < 0) {
+          state.buffered = "";
+          break;
+        }
+        state.buffered = state.buffered.slice(newline + 1);
+        state.discarding = false;
+        continue;
+      }
+
+      const newline = state.buffered.indexOf("\n");
+      if (newline < 0) {
+        if (state.buffered.length > maxLineChars) {
+          state.buffered = "";
+          state.discarding = true;
+          normalized.push(unavailableLineMarker);
+        } else if (flush) {
+          normalized.push(normalizeLine(state.buffered));
+          state.buffered = "";
+        }
+        break;
+      }
+
+      const line = state.buffered.slice(0, newline);
+      state.buffered = state.buffered.slice(newline + 1);
+      normalized.push(`${normalizeLine(line)}\n`);
+    }
+
+    return normalized;
+  };
+
+  return {
+    push(stream: RunLogStream, chunk: string) {
+      return consume(stream, chunk, false);
+    },
+    flush() {
+      return (Object.keys(states) as RunLogStream[]).flatMap((stream) =>
+        consume(stream, "", true).map((chunk) => ({ stream, chunk })),
+      );
+    },
+  };
 }
 
 function normalizeMaxConcurrentRuns(value: unknown) {
@@ -22189,6 +22294,7 @@ export function heartbeatService(
       };
 
       let handle: RunLogHandle | null = null;
+      let flushRunLogChunks: (() => Promise<void>) | null = null;
       const goalCheckpointSession: {
         current: {
           params: Record<string, unknown>;
@@ -22325,15 +22431,40 @@ export function heartbeatService(
 
         const currentUserRedactionOptions =
           await getCurrentUserRedactionOptions();
-        const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
-          const sanitizedChunk = compactRunLogChunk(
-            redactCurrentUserText(chunk, currentUserRedactionOptions),
-          );
+        const runLogChunkNormalizer = createRunLogChunkNormalizer({
+          currentUserRedactionOptions,
+        });
+        let onLogChain = Promise.resolve();
+        const touchLogActivity = (ts: string) => {
+          // Streamed CLI output is real run activity even while a partial
+          // provider frame is buffered for complete-line redaction.
+          const logActivityAt = new Date(ts);
+          if (
+            isHeartbeatRunRuntimeStatusActive(run.status) &&
+            logActivityAt.getTime() - lastLogRuntimeStatusTouchMs >=
+              ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS
+          ) {
+            lastLogRuntimeStatusTouchMs = logActivityAt.getTime();
+            const touchedStatus = touchHeartbeatRunRuntimeStatus({
+              companyId: run.companyId,
+              issueId,
+              agentId: run.agentId,
+              runId: run.id,
+              at: logActivityAt,
+            });
+            if (touchedStatus)
+              publishHeartbeatRunRuntimeProgress(touchedStatus);
+          }
+        };
+        const persistLogChunk = async (
+          stream: "stdout" | "stderr",
+          sanitizedChunk: string,
+          ts: string,
+        ) => {
           if (stream === "stdout")
             stdoutExcerpt = appendExcerpt(stdoutExcerpt, sanitizedChunk);
           if (stream === "stderr")
             stderrExcerpt = appendExcerpt(stderrExcerpt, sanitizedChunk);
-          const ts = new Date().toISOString();
 
           outputSeq += 1;
           const chunkSeq = outputSeq;
@@ -22354,29 +22485,6 @@ export function heartbeatService(
             bytes: persistedLogBytes,
           };
           await flushOutputProgress();
-
-          // Streamed CLI output is real run activity: keep the in-memory
-          // runtime status ("Working... / X ago") fresh between structured
-          // events so sandbox runs with mid-run log streaming never show a
-          // minutes-stale timestamp. Throttled to avoid churning the live
-          // event stream on every 250ms tail chunk.
-          const logActivityAt = new Date(ts);
-          if (
-            isHeartbeatRunRuntimeStatusActive(run.status) &&
-            logActivityAt.getTime() - lastLogRuntimeStatusTouchMs >=
-              ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS
-          ) {
-            lastLogRuntimeStatusTouchMs = logActivityAt.getTime();
-            const touchedStatus = touchHeartbeatRunRuntimeStatus({
-              companyId: run.companyId,
-              issueId,
-              agentId: run.agentId,
-              runId: run.id,
-              at: logActivityAt,
-            });
-            if (touchedStatus)
-              publishHeartbeatRunRuntimeProgress(touchedStatus);
-          }
 
           const payloadChunk =
             sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
@@ -22399,6 +22507,27 @@ export function heartbeatService(
               truncated: payloadChunk.length !== sanitizedChunk.length,
             },
           });
+        };
+        const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
+          const ts = new Date().toISOString();
+          touchLogActivity(ts);
+          const pending = onLogChain.then(async () => {
+            for (const sanitizedChunk of runLogChunkNormalizer.push(stream, chunk)) {
+              await persistLogChunk(stream, sanitizedChunk, ts);
+            }
+          });
+          onLogChain = pending.catch(() => undefined);
+          await pending;
+        };
+        flushRunLogChunks = async () => {
+          const pending = onLogChain.then(async () => {
+            const ts = new Date().toISOString();
+            for (const { stream, chunk } of runLogChunkNormalizer.flush()) {
+              await persistLogChunk(stream, chunk, ts);
+            }
+          });
+          onLogChain = pending.catch(() => undefined);
+          await pending;
         };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
@@ -24260,6 +24389,7 @@ export function heartbeatService(
           sha256?: string;
           compressed: boolean;
         } | null = null;
+        await flushRunLogChunks?.();
         if (handle) {
           logSummary = await runLogStore.finalize(handle);
         }
@@ -24963,6 +25093,7 @@ export function heartbeatService(
         } | null = null;
         if (handle) {
           try {
+            await flushRunLogChunks?.();
             logSummary = await runLogStore.finalize(handle);
           } catch (finalizeErr) {
             logger.warn(
