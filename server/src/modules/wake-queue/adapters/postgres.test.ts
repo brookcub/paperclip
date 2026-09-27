@@ -8,6 +8,7 @@ import {
   agents,
   companies,
   createDb,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   heartbeatRuns,
   heartbeatRunEvents,
   issueComments,
@@ -54,7 +55,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-wake-queue-postgres-adapter-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     await db.delete(issueComments);
