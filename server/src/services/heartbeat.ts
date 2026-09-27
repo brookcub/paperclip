@@ -9673,12 +9673,7 @@ export function heartbeatService(
           },
         });
         if (options.deferRunStart) {
-          void startNextQueuedRunForAgent(effect.run.agentId).catch((err) => {
-            logger.error(
-              { err, runId: effect.run.id },
-              "deferred queued-run start failed",
-            );
-          });
+          trackDeferredQueuedRunStart(effect.run.agentId, effect.run.id);
         } else {
           await startNextQueuedRunForAgent(effect.run.agentId);
         }
@@ -20071,6 +20066,18 @@ export function heartbeatService(
         activeWakeupPromises.delete(promise);
       });
     return promise;
+  }
+
+  function trackDeferredQueuedRunStart(agentId: string, runId: string) {
+    const promise = startNextQueuedRunForAgent(agentId);
+    activeWakeupPromises.add(promise);
+    void promise
+      .catch((err) => {
+        logger.error({ err, runId }, "deferred queued-run start failed");
+      })
+      .finally(() => {
+        activeWakeupPromises.delete(promise);
+      });
   }
 
   async function executeRun(

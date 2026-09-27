@@ -222,6 +222,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     ] } });
     const heartbeat = heartbeatService(db);
     await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+    await heartbeat.drainActiveRunExecutions();
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     expect(runs).toHaveLength(1);
     const [run] = runs;
