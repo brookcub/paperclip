@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const YOLO_WARNING = "YOLO mode is enabled. All tool calls will be automatically approved.";
 
@@ -120,6 +120,9 @@ describe("codex_local stderr fallback error derivation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
   it("skips the benign YOLO approvals warning and surfaces the real stderr error", async () => {
     mockFailedProcess(
@@ -213,6 +216,7 @@ describe("codex_local stderr fallback error derivation", () => {
 
   it("captures only the monitor attempt's observed thread ID", async () => {
     const threadId = "019cabcd-1234-7abc-8def-0123456789ab";
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true as never);
     runAdapterExecutionTargetProcess.mockImplementationOnce(async (...args: unknown[]) => {
       const options = args[4] as {
         onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
@@ -233,10 +237,10 @@ describe("codex_local stderr fallback error derivation", () => {
         completionEvidence: {
           sessionId: threadId,
           status: "unavailable",
-          parseGaps: ["codex_sessions_dir_unavailable"],
         },
       },
     });
+    expect(kill).toHaveBeenCalledWith(999_999, "SIGTERM");
   });
 });
 
