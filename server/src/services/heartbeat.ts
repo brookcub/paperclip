@@ -17329,6 +17329,28 @@ export function heartbeatService(
     };
   }
 
+  function capabilityPreflightReceipt(input: {
+    preflight: CapabilityPreflight | null;
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string | null;
+    decidedAt: Date;
+  }) {
+    if (!input.preflight?.result.admitted || !input.issueId) return {};
+    return {
+      capabilityPreflight: {
+        version: 1,
+        runId: input.run.id,
+        issueId: input.issueId,
+        agentId: input.run.agentId,
+        decidedAt: input.decidedAt.toISOString(),
+        admitted: true,
+        requirements: input.preflight.result.requirements,
+        admittedPolicy: input.preflight.result.admittedPolicy,
+        unmet: [],
+      },
+    };
+  }
+
   async function capabilityPreflightStillCurrent(
     tx: Db,
     run: typeof heartbeatRuns.$inferSelect,
@@ -17575,6 +17597,12 @@ export function heartbeatService(
     }
 
     const claimedAt = new Date();
+    const capabilityReceipt = capabilityPreflightReceipt({
+      preflight: capabilityPreflight,
+      run,
+      issueId,
+      decidedAt: claimedAt,
+    });
     const responsibleUserId = await resolveResponsibleUserIdForRun({
       run,
       contextSnapshot: context,
@@ -17759,7 +17787,7 @@ export function heartbeatService(
                   .update(heartbeatRuns)
                   .set({
                     status: "running",
-                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType }, ...capabilityReceipt })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
                     responsibleUserId,
                     startedAt: lockedRun.startedAt ?? claimedAt,
@@ -17864,7 +17892,7 @@ export function heartbeatService(
                 .update(heartbeatRuns)
                 .set({
                   status: "running",
-                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType }, ...capabilityReceipt })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
@@ -17938,7 +17966,7 @@ export function heartbeatService(
             .update(heartbeatRuns)
             .set({
               status: "running",
-              runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+              runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType }, ...capabilityReceipt })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
               responsibleUserId,
               startedAt: run.startedAt ?? claimedAt,
@@ -23785,7 +23813,11 @@ export function heartbeatService(
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
                 then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
-                else '{}'::jsonb end) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'capabilityPreflight'
+                then jsonb_build_object('capabilityPreflight', ${heartbeatRuns.runnerProfileJson}->'capabilityPreflight')
+                else '{}'::jsonb end)
+              || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
               updatedAt: new Date(),
             })
             .where(eq(heartbeatRuns.id, run.id));

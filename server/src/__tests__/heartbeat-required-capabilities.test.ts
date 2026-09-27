@@ -193,6 +193,7 @@ describeEmbedded("heartbeat required capability admission", () => {
   async function expectUnstarted(companyId: string) {
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     expect(run).toMatchObject({ status: "queued", startedAt: null });
+    expect(run?.runnerProfileJson ?? {}).not.toHaveProperty("capabilityPreflight");
     expect(execute).not.toHaveBeenCalled();
   }
 
@@ -246,6 +247,10 @@ describeEmbedded("heartbeat required capability admission", () => {
     expect(runs).toHaveLength(1);
     const [run] = runs;
     expect(run).toMatchObject({ status: "cancelled", startedAt: null, errorCode: "required_capabilities_unavailable" });
+    expect(run?.runnerProfileJson ?? {}).not.toHaveProperty("capabilityPreflight");
+    expect(run?.resultJson).toMatchObject({
+      requiredCapabilities: { admitted: false },
+    });
     expect(execute).not.toHaveBeenCalled();
   });
 
@@ -408,6 +413,41 @@ describeEmbedded("heartbeat required capability admission", () => {
     const heartbeat = heartbeatService(db);
     const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
     await expectExecuted(heartbeat, run);
+    const stored = await heartbeat.getRun(run!.id);
+    expect(stored?.runnerProfileJson).toMatchObject({
+      capabilityPreflight: {
+        version: 1,
+        runId: run!.id,
+        issueId,
+        agentId,
+        admitted: true,
+        requirements: [{ kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" }],
+        admittedPolicy: [{ id: "tool:codex_cli:shell", authorization: "conditional" }],
+        unmet: [],
+        decidedAt: expect.any(String),
+      },
+    });
+    const receipt = (stored?.runnerProfileJson as Record<string, unknown> | null)?.capabilityPreflight as Record<string, unknown>;
+    expect(new Date(receipt.decidedAt as string)).toEqual(stored?.startedAt);
+    expect(Object.keys(receipt).sort()).toEqual([
+      "admitted",
+      "admittedPolicy",
+      "agentId",
+      "decidedAt",
+      "issueId",
+      "requirements",
+      "runId",
+      "unmet",
+      "version",
+    ]);
+  });
+
+  it("does not retain an affirmative receipt without an issue preflight", async () => {
+    const { agentId } = await seed({});
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: {} });
+    await expectExecuted(heartbeat, run);
+    expect((await heartbeat.getRun(run!.id))?.runnerProfileJson ?? {}).not.toHaveProperty("capabilityPreflight");
   });
 
   it("admits the dispatch-created local default for a required Codex tool", async () => {
