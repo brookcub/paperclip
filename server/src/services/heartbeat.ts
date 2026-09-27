@@ -17167,18 +17167,26 @@ export function heartbeatService(
     }
     const config = parseObject(agent.adapterConfig);
     const preference = readPaperclipSkillSyncPreference(config);
+    const skillVersionPinsEnabled = (await instanceSettings.get()).experimental.enableBetaSkills === true;
+    snapshot.skillVersionPinsEnabled = skillVersionPinsEnabled;
     // This is phase A: it uses the same delivery resolver as dispatch, before
     // any run-start mutation. Materialization is deliberately outside locks.
     const entries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
       versionSelections: skillVersionSelectionMap(preference.desiredSkillEntries, {
-        versionPinsEnabled: false,
+        versionPinsEnabled: skillVersionPinsEnabled,
       }),
     });
     const desiredSkillKeys = resolveLegacyPaperclipDesiredSkillNames(config, entries);
+    const selectedSkillRows = desiredSkillKeys.length === 0 ? [] : await db
+      .select({ key: companySkillsTable.key, currentVersionId: companySkillsTable.currentVersionId, updatedAt: companySkillsTable.updatedAt })
+      .from(companySkillsTable)
+      .where(and(eq(companySkillsTable.companyId, agent.companyId), inArray(companySkillsTable.key, desiredSkillKeys)));
     const verifiedSkillEntries = desiredSkillKeys.flatMap((key) => {
       const entry = entries.find((candidate) => candidate.key === key);
+      const row = selectedSkillRows.find((candidate) => candidate.key === key);
       return entry?.sourceStatus === "available"
-        ? [{ key, versionId: entry.versionId ?? null, currentVersionId: entry.currentVersionId ?? null }]
+        && row
+        ? [{ key, versionId: entry.versionId ?? null, currentVersionId: row.currentVersionId, updatedAt: row.updatedAt.toISOString() }]
         : [];
     });
     const selected = verifiedSkillEntries.map((entry) => entry.key);
@@ -17243,7 +17251,7 @@ export function heartbeatService(
     if (!issue || !currentAgent) return false;
     if (snapshot.skillRevisions.some((skill) => {
       const row = skillRows.find((candidate) => candidate.key === skill.key);
-      return !row || row.currentVersionId !== skill.currentVersionId ||
+      return !row || row.currentVersionId !== skill.currentVersionId || row.updatedAt.toISOString() !== skill.updatedAt ||
         (skill.versionId !== null && !skillVersions.some((version) => version.id === skill.versionId && version.companySkillId === row.id));
     })) return false;
     return capabilityPreflightSnapshotIsCurrent(snapshot, {

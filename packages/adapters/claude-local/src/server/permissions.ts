@@ -127,7 +127,7 @@ export function resolveClaudeStaticToolPolicy(input: {
   if (!explicitlyPresent || exactDenied) {
     return { present: false, authorization: "denied", reason: exactDenied ? "tool_disallowed" : "tool_not_selected" };
   }
-  const bypass = input.config.dangerouslySkipPermissions !== false &&
+  const bypass = asBoolean(input.config.dangerouslySkipPermissions, true) &&
     !shouldUseAllowedTools(input);
   if (bypass) return { present: true, authorization: "unprompted", reason: "dangerously_skip_permissions" };
   if (allow.values.includes(input.tool)) return { present: true, authorization: "unprompted", reason: "explicit_allowed_tool" };
@@ -161,3 +161,4 @@ export function buildClaudeExecutionPermissionArgs(input: {
   }
   return ["--dangerously-skip-permissions"];
 }
+import { asBoolean } from "@paperclipai/adapter-utils/server-utils";

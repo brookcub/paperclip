@@ -2,12 +2,12 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { heartbeatService } from "../services/heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const execute = vi.hoisted(() => vi.fn());
-vi.mock("../adapters/index.ts", async () => ({
-  ...(await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts")),
+vi.mock("../adapters/index.js", async () => ({
+  ...(await vi.importActual<typeof import("../adapters/index.js")>("../adapters/index.js")),
   getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute })),
 }));
 

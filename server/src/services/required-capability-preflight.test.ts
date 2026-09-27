@@ -17,27 +17,6 @@ vi.mock("@paperclipai/adapter-codex-local/server", () => ({
       ? { present: true, authorization: "conditional", reason: "codex_approval_policy" }
       : { present: false, authorization: "unknown", reason: "codex_cli_engine_not_selected" },
 }));
-vi.mock("@paperclipai/shared", () => {
-  return {
-    requiredCapabilitiesSchema: {
-      safeParse: (value: unknown) => {
-        const catalog = value as { version?: unknown; items?: unknown };
-        const valid = Array.isArray(catalog?.items) && catalog.items.length > 0 && catalog.items.every((item) => {
-          const row = item as Record<string, unknown>;
-          const when = row.when as Record<string, unknown> | undefined;
-          const validWhen = when === undefined || (Object.keys(when).length === 1 && typeof when.agentId === "string" && when.agentId.length > 0);
-          return validWhen && (
-            (row.kind === "skill" && typeof row.key === "string") ||
-            (row.kind === "permission" && row.key === "agents:suggest-changes") ||
-            (row.kind === "tool" && ["claude_cli", "codex_cli", "paperclip_mcp"].includes(row.runtime as string) && typeof row.name === "string" && ["conditional_ok", "must_not_prompt"].includes(row.authorization as string))
-          );
-        });
-        if (catalog?.version !== 1 || !valid) return { success: false };
-        return { success: true, data: catalog as { version: 1; items: Array<Record<string, unknown>> } };
-      },
-    },
-  };
-});
 import {
   capabilityPreflightSnapshotIsCurrent,
   evaluateRequiredCapabilities,
