@@ -244,6 +244,21 @@ describeEmbedded("heartbeat required capability admission", () => {
     const startLockPaused = new Promise<void>((resolve) => { releaseStartLock = resolve; });
     let heldStartLock: Promise<void> | null = null;
     let hookUsed = false;
+    async function awaitStage<T>(stage: string, promise: Promise<T>): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<T>((_, reject) => {
+            timer = setTimeout(() => {
+              reject(new Error(`${stage}: ${JSON.stringify(getTaskDrainStatus())}`));
+            }, 4_000);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
     const heartbeat = heartbeatService(db, {
       beforeChatControlRecoveryCheck: async ({ stage }) => {
         if (stage !== "claim" || hookUsed) return;
@@ -258,7 +273,7 @@ describeEmbedded("heartbeat required capability admission", () => {
 
     try {
       const outerWake = wakeQueuedAutomation(heartbeat, companyId, agentId, issueId);
-      await claimReached;
+      await awaitStage("claim hook", claimReached);
       const [comment] = await db.insert(issueComments).values({
         companyId,
         issueId,
@@ -285,7 +300,7 @@ describeEmbedded("heartbeat required capability admission", () => {
         },
       });
       releaseClaim();
-      await outerWake;
+      await awaitStage("outer wake", outerWake);
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(getTaskDrainStatus()).toMatchObject({
         activeRuns: 0,
@@ -304,8 +319,8 @@ describeEmbedded("heartbeat required capability admission", () => {
       await db.update(issues).set({ executionPolicy: {} }).where(eq(issues.id, issueId));
 
       releaseStartLock();
-      await heldStartLock;
-      await heartbeat.drainActiveRunExecutions();
+      await awaitStage("queued lock", heldStartLock!);
+      await awaitStage("lifecycle drain", heartbeat.drainActiveRunExecutions());
       expect(getTaskDrainStatus()).toMatchObject({
         activeRuns: 0,
         pendingWakes: 0,
