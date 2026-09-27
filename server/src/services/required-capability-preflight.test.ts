@@ -44,6 +44,28 @@ describe("required capability preflight", () => {
     ]));
   });
 
+  it("labels an unavailable selected skill source without implying a required pin", () => {
+    const result = evaluateRequiredCapabilities({
+      requirements: [{ kind: "skill", key: "ponytail-skill" }],
+      agentId: "agent-1", adapterType: "claude_local", adapterConfig: {}, targetIsRemote: false,
+      selectedSkillKeys: [], unverifiedSkillKeys: ["ponytail-skill"], skillSelectionsVerified: true,
+      agentPermissionKeys: [], managedMcpToolNames: [],
+    });
+    expect(result.unmet).toContainEqual(expect.objectContaining({ reason: "skill_source_unavailable" }));
+  });
+
+  it("refuses CLI tool admission when the resolved target is unknown or remote Codex", () => {
+    const requirement = [{ kind: "tool", runtime: "codex_cli" as const, name: "shell", authorization: "conditional_ok" as const }];
+    for (const [targetIsRemote, reason] of [[null, "execution_target_unresolved"], [true, "remote_codex_policy_unqualified"]] as const) {
+      const result = evaluateRequiredCapabilities({
+        requirements: requirement,
+        agentId: "agent-1", adapterType: "codex_local", adapterConfig: { engine: "cli" }, targetIsRemote,
+        selectedSkillKeys: [], skillSelectionsVerified: true, agentPermissionKeys: [], managedMcpToolNames: [],
+      });
+      expect(result.unmet).toContainEqual(expect.objectContaining({ reason }));
+    }
+  });
+
   it("requires a non-prompting policy only when declared", () => {
     const result = evaluateRequiredCapabilities({ requirements: [{ kind: "tool", runtime: "claude_cli", name: "Bash", authorization: "must_not_prompt" }], agentId: "agent-1", adapterType: "claude_local", adapterConfig: { dangerouslySkipPermissions: false }, targetIsRemote: false, selectedSkillKeys: [], skillSelectionsVerified: false, agentPermissionKeys: [], managedMcpToolNames: [] });
     expect(result.unmet).toContainEqual(expect.objectContaining({ reason: "unprompted_authorization_required" }));
@@ -73,7 +95,7 @@ describe("required capability preflight", () => {
     const snapshot = {
       issueId: "issue-1", agentId: "agent-1", issueUpdatedAt: "2026-09-27T00:00:00.000Z", executionPolicy: stableCapabilitySnapshot({ requiredCapabilities: { version: 1 } }),
       agentUpdatedAt: "2026-09-27T00:00:00.000Z", adapterType: "claude_local", adapterConfig: stableCapabilitySnapshot({ dangerouslySkipPermissions: false }),
-      permissionKeys: ["agents:suggest-changes"], allowedAgentPermissionKeys: ["agents:suggest-changes"], managedMcpRevision: "mcp-1", skillRevisions: [], skillVersionPinsEnabled: false,
+      permissionKeys: ["agents:suggest-changes"], allowedAgentPermissionKeys: ["agents:suggest-changes"], managedMcpRevision: "mcp-1", executionTargetRevision: "target-1", skillRevisions: [], skillVersionPinsEnabled: false,
     };
     expect(capabilityPreflightSnapshotIsCurrent(snapshot, { ...snapshot })).toBe(true);
     expect(capabilityPreflightSnapshotIsCurrent(snapshot, { ...snapshot, allowedAgentPermissionKeys: [] })).toBe(false);
@@ -81,20 +103,23 @@ describe("required capability preflight", () => {
   });
 
   it("keeps declared builder and reviewer requirements bound to their exact actors", () => {
+    const builder = "11111111-1111-4111-8111-111111111111";
+    const reviewer = "22222222-2222-4222-8222-222222222222";
+    const replacement = "33333333-3333-4333-8333-333333333333";
     const handoff = readRequiredCapabilities({ requiredCapabilities: { version: 1, items: [
-      { kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok", when: { agentId: "builder" } },
-      { kind: "tool", runtime: "claude_cli", name: "Bash", authorization: "conditional_ok", when: { agentId: "reviewer" } },
+      { kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok", when: { agentId: builder } },
+      { kind: "tool", runtime: "claude_cli", name: "Bash", authorization: "conditional_ok", when: { agentId: reviewer } },
     ] } });
     expect(evaluateRequiredCapabilities({
-      requirements: handoff, agentId: "builder", adapterType: "codex_local", adapterConfig: { engine: "cli" }, targetIsRemote: false,
+      requirements: handoff, agentId: builder, adapterType: "codex_local", adapterConfig: { engine: "cli" }, targetIsRemote: false,
       selectedSkillKeys: [], skillSelectionsVerified: false, agentPermissionKeys: [], managedMcpToolNames: [],
     }).admitted).toBe(true);
     expect(evaluateRequiredCapabilities({
-      requirements: handoff, agentId: "reviewer", adapterType: "claude_local", adapterConfig: { dangerouslySkipPermissions: false }, targetIsRemote: false,
+      requirements: handoff, agentId: reviewer, adapterType: "claude_local", adapterConfig: { dangerouslySkipPermissions: false }, targetIsRemote: false,
       selectedSkillKeys: [], skillSelectionsVerified: false, agentPermissionKeys: [], managedMcpToolNames: [],
     }).admitted).toBe(true);
     expect(evaluateRequiredCapabilities({
-      requirements: handoff, agentId: "replacement", adapterType: "claude_local", adapterConfig: {}, targetIsRemote: false,
+      requirements: handoff, agentId: replacement, adapterType: "claude_local", adapterConfig: {}, targetIsRemote: false,
       selectedSkillKeys: [], skillSelectionsVerified: false, agentPermissionKeys: [], managedMcpToolNames: [],
     }).unmet).toContainEqual(expect.objectContaining({ reason: "actor_requirements_missing" }));
   });

@@ -34,7 +34,7 @@ describeEmbedded("heartbeat required capability admission", () => {
   beforeAll(async () => {
     temp = await startEmbeddedPostgresTestDatabase("paperclip-required-capabilities-");
     db = createDb(temp.connectionString);
-  }, 20_000);
+  }, 60_000);
   afterAll(async () => { await temp?.cleanup(); });
   afterEach(async () => {
     execute.mockReset();
@@ -163,7 +163,7 @@ describeEmbedded("heartbeat required capability admission", () => {
       { kind: "skill", key },
       { kind: "permission", key: "agents:suggest-changes" },
       { kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" },
-    ] } }).where(eq(issues.id, issueId));
+    ] } } }).where(eq(issues.id, issueId));
     await grantAgentPermission(companyId, agentId, "agents:suggest-changes");
     try {
       const heartbeat = heartbeatService(db);
