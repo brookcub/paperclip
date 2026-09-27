@@ -162,6 +162,17 @@ describeEmbedded("heartbeat required capability admission", () => {
     expect(execute).toHaveBeenCalled();
   });
 
+  it("admits the dispatch-created local default for a required Codex tool", async () => {
+    const { agentId, issueId } = await seed({ requiredCapabilities: { version: 1, items: [
+      { kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" },
+    ] } });
+    await db.delete(environments).where(eq(environments.driver, "local"));
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
+    if (run) await heartbeat.waitForRunExecutionDrain(run.id);
+    expect(execute).toHaveBeenCalled();
+  });
+
   it("admits a selected local skill and an active agent grant", async () => {
     const { companyId, agentId, issueId } = await seed({});
     const { key, source } = await installSelectedLocalSkill(companyId);

@@ -17081,7 +17081,9 @@ export function heartbeatService(
     const base = {
       agentDefaultEnvironmentId: input.agentDefaultEnvironmentId,
       instanceDefaultEnvironmentId: input.settings.defaultEnvironmentId,
-      instanceSettingsUpdatedAt: input.settings.updatedAt.toISOString(),
+      instanceSettingsUpdatedAt: input.settings.updatedAt instanceof Date
+        ? input.settings.updatedAt.toISOString()
+        : String(input.settings.updatedAt),
       executionMode: input.settings.general.executionMode,
       managedSandboxOnly:
         input.settings.experimental.enableManagedSandboxOnly === true,
@@ -17089,17 +17091,28 @@ export function heartbeatService(
         ? [local.id, local.driver, local.updatedAt.toISOString()]
         : null,
     };
+    const forcedKubernetes = isExecutionForcedToKubernetes({
+      executionMode: input.settings.general.executionMode,
+    });
+    const dispatchWillCreateLocal = !local &&
+      !input.agentDefaultEnvironmentId &&
+      !input.settings.defaultEnvironmentId &&
+      !forcedKubernetes &&
+      input.settings.experimental.enableManagedSandboxOnly !== true;
     if (!local) {
       return {
-        targetIsRemote: null,
-        revision: stableCapabilitySnapshot({ ...base, selectedEnvironment: null }),
+        targetIsRemote: dispatchWillCreateLocal ? false : null,
+        revision: stableCapabilitySnapshot({
+          ...base,
+          selectedEnvironment: dispatchWillCreateLocal
+            ? ["dispatch_default_local"]
+            : null,
+        }),
       };
     }
 
     let selected: Awaited<ReturnType<typeof environments.getById>> = null;
-    if (isExecutionForcedToKubernetes({
-      executionMode: input.settings.general.executionMode,
-    })) {
+    if (forcedKubernetes) {
       selected = await environments.findKubernetesEnvironment();
     } else {
       const managed = input.settings.experimental.enableManagedSandboxOnly === true
@@ -17346,11 +17359,13 @@ export function heartbeatService(
       instanceSettingsService(tx).get(),
     ]);
     if (!issue || !currentAgent) return false;
-    const executionTarget = await resolveCapabilityPreflightExecutionTarget({
-      readDb: tx,
-      agentDefaultEnvironmentId: currentAgent.defaultEnvironmentId,
-      settings: currentInstanceSettings,
-    });
+    const executionTargetRevision = snapshot.executionTargetRevision === ""
+      ? ""
+      : (await resolveCapabilityPreflightExecutionTarget({
+        readDb: tx,
+        agentDefaultEnvironmentId: currentAgent.defaultEnvironmentId,
+        settings: currentInstanceSettings,
+      })).revision;
     if (snapshot.skillRevisions.some((skill) => {
       const row = skillRows.find((candidate) => candidate.key === skill.key);
       return !row || row.currentVersionId !== skill.currentVersionId || row.updatedAt.toISOString() !== skill.updatedAt ||
@@ -17372,7 +17387,7 @@ export function heartbeatService(
         entries: tools.entries.map((entry) => [entry.id, entry.updatedAt.toISOString()]).sort(),
         bindings: tools.bindings.map((binding) => [binding.id, binding.updatedAt.toISOString()]).sort(),
       }),
-      executionTargetRevision: executionTarget.revision,
+      executionTargetRevision,
       skillRevisions: snapshot.skillRevisions,
       skillVersionPinsEnabled: currentInstanceSettings.experimental.enableBetaSkills === true,
     });
