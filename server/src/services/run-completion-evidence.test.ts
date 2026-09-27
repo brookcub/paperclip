@@ -223,7 +223,15 @@ describe("run completion evidence", () => {
       providerTrace: null,
       providerTraceRequested: false,
     });
-    const projection = JSON.parse(evidence.transcript.files[0].promptSnapshotToolProjections[0]);
+    expect(evidence.transcript.status).not.toBe("not_applicable");
+    if (!("files" in evidence.transcript)) {
+      throw new Error("Expected Claude transcript evidence");
+    }
+    const [file] = evidence.transcript.files;
+    if (!file) throw new Error("Expected a Claude transcript file");
+    const [serializedProjection] = file.promptSnapshotToolProjections;
+    if (!serializedProjection) throw new Error("Expected a tool schema projection");
+    const projection = JSON.parse(serializedProjection);
     expect(projection.inputSchemaShapeSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(projection.inputSchemaShapeSha256).not.toBe("a".repeat(64));
   });
