@@ -1253,22 +1253,13 @@ export function IssueProperties({
       ? M | null
       : never
     : never) => {
-    const basePolicy = buildExecutionPolicy({
-      existingPolicy: issue.executionPolicy ?? null,
-      reviewerValues,
-      approverValues,
-    });
-    if (!basePolicy && !nextMonitor) {
-      onUpdate({ executionPolicy: null });
-      return;
-    }
     onUpdate({
-      executionPolicy: {
-        mode: basePolicy?.mode ?? issue.executionPolicy?.mode ?? "normal",
-        commentRequired: true,
-        stages: basePolicy?.stages ?? [],
-        ...(nextMonitor ? { monitor: nextMonitor } : {}),
-      },
+      executionPolicy: buildExecutionPolicy({
+        existingPolicy: issue.executionPolicy ?? null,
+        reviewerValues,
+        approverValues,
+        monitor: nextMonitor,
+      }),
     });
   };
   const saveMonitor = () => {

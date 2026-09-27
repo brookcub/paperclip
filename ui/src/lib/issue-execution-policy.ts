@@ -80,10 +80,13 @@ export function buildExecutionPolicy(input: {
   existingPolicy?: IssueExecutionPolicy | null;
   reviewerValues: string[];
   approverValues: string[];
+  monitor?: IssueExecutionPolicy["monitor"];
 }): IssueExecutionPolicy | null {
-  const mode = input.existingPolicy?.mode ?? "normal";
+  const { monitor: existingMonitor, ...existingPolicy } = input.existingPolicy ?? {};
+  const mode = existingPolicy.mode ?? "normal";
   const stages: IssueExecutionPolicy["stages"] = [];
-  const monitor = input.existingPolicy?.monitor ?? null;
+  // Omitted preserves the schedule; explicit null removes it from the replacement policy.
+  const monitor = input.monitor === undefined ? existingMonitor : input.monitor;
 
   const existingReviewStage = input.existingPolicy?.stages.find((stage) => stage.type === "review");
   const reviewParticipants = mergeParticipants(existingReviewStage?.participants, input.reviewerValues);
@@ -107,9 +110,11 @@ export function buildExecutionPolicy(input: {
     });
   }
 
-  if (stages.length === 0 && !monitor) return null;
+  if (stages.length === 0 && !monitor && !existingPolicy.requiredCapabilities &&
+      !existingPolicy.reviewPreset && !existingPolicy.authorizationPolicy) return null;
 
   return {
+    ...existingPolicy,
     mode,
     commentRequired: true,
     stages,

@@ -2683,7 +2683,13 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
-  it("renders monitor controls and clears an existing monitor", async () => {
+  it.each([false, true])("clears an existing monitor while preserving unrelated policy fields (%s)", async (retainFields) => {
+    const preservedFields: Partial<IssueExecutionPolicy> = retainFields ? {
+      requiredCapabilities: { version: 1, items: [{ kind: "skill", key: "company/test/runtime" }] },
+      reviewPreset: { id: "low_trust_review", version: 1, rawOutputDisposition: "quarantine" },
+      authorizationPolicy: { trustPreset: "low_trust_review" },
+      maxReviewRounds: 5,
+    } : {};
     const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(new Date("2026-04-11T10:00:00.000Z").getTime());
     const onUpdate = vi.fn();
     const root = renderProperties(container, {
@@ -2691,6 +2697,7 @@ describe("IssueProperties", () => {
         status: "in_progress",
         assigneeAgentId: "agent-1",
         executionPolicy: createExecutionPolicy({
+          ...preservedFields,
           monitor: {
             nextCheckAt: "2026-04-11T12:30:00.000Z",
             notes: "Check deployment",
@@ -2753,11 +2760,12 @@ describe("IssueProperties", () => {
     });
 
     expect(onUpdate).toHaveBeenCalledWith({
-      executionPolicy: {
+      executionPolicy: retainFields ? {
         mode: "normal",
         commentRequired: true,
         stages: [],
-      },
+        ...preservedFields,
+      } : null,
     });
 
     act(() => root.unmount());
