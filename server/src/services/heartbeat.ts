@@ -432,7 +432,6 @@ import {
   isRuntimeOwnedGitBranch,
 } from "./execution-workspace-branch-ownership.js";
 import {
-  capabilityRequirementId,
   cleanupHeartbeatRunScratch,
   prepareHeartbeatRunScratchForExecution,
   type HeartbeatRunScratch,
@@ -575,6 +574,7 @@ import {
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
 import {
+  capabilityRequirementId,
   capabilityPreflightSnapshotIsCurrent,
   evaluateRequiredCapabilities,
   readRequiredCapabilities,
@@ -17084,7 +17084,24 @@ export function heartbeatService(
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
       .then((rows) => rows[0] ?? null);
     const requirements = readRequiredCapabilities(issue?.executionPolicy);
-    if (requirements.length === 0) return null;
+    if (requirements.length === 0) {
+      return {
+        result: { admitted: true, requirements, unmet: [], admittedPolicy: [] },
+        snapshot: {
+          issueId,
+          agentId: agent.id,
+          issueUpdatedAt: issue!.updatedAt.toISOString(),
+          executionPolicy: stableCapabilitySnapshot(issue!.executionPolicy),
+          agentUpdatedAt: agent.updatedAt.toISOString(),
+          adapterType: agent.adapterType,
+          adapterConfig: stableCapabilitySnapshot(agent.adapterConfig),
+          permissionKeys: [],
+          allowedAgentPermissionKeys: [],
+          managedMcpRevision: "",
+          skillRevisions: [],
+        },
+      };
+    }
     const permissionKeys = requirements
       .filter((requirement) =>
         requirement.kind === "permission" && (!requirement.when || requirement.when.agentId === agent.id),
@@ -17113,12 +17130,13 @@ export function heartbeatService(
       adapterConfig: stableCapabilitySnapshot(agent.adapterConfig),
       permissionKeys,
       allowedAgentPermissionKeys,
-      managedMcpRevision: stableCapabilitySnapshot({
+      managedMcpRevision: snapshot.managedMcpRevision === "" ? "" : stableCapabilitySnapshot({
         names: tools.allowedToolNames.slice().sort(),
         profiles: tools.profiles.map((profile) => [profile.id, profile.updatedAt.toISOString()]).sort(),
         entries: tools.entries.map((entry) => [entry.id, entry.updatedAt.toISOString()]).sort(),
         bindings: tools.bindings.map((binding) => [binding.id, binding.updatedAt.toISOString()]).sort(),
       }),
+      skillRevisions: [],
     };
     // Dispatch applies an issue override and mention-scoped keys later. Do not
     // certify the agent default when either would change that effective input.
@@ -17148,8 +17166,16 @@ export function heartbeatService(
         versionPinsEnabled: false,
       }),
     });
-    const selected = resolveLegacyPaperclipDesiredSkillNames(config, entries)
-      .filter((key) => entries.some((entry) => entry.key === key && entry.sourceStatus === "available"));
+    const desiredSkillKeys = resolveLegacyPaperclipDesiredSkillNames(config, entries);
+    const verifiedSkillEntries = desiredSkillKeys.flatMap((key) => {
+      const entry = entries.find((candidate) => candidate.key === key);
+      return entry?.sourceStatus === "available" && entry.versionId
+        ? [{ key, versionId: entry.versionId, currentVersionId: entry.currentVersionId ?? null }]
+        : [];
+    });
+    const selected = verifiedSkillEntries.map((entry) => entry.key);
+    const unverifiedSkillKeys = desiredSkillKeys.filter((key) => !selected.includes(key));
+    snapshot.skillRevisions = verifiedSkillEntries;
     return {
       result: evaluateRequiredCapabilities({
       requirements,
@@ -17158,10 +17184,8 @@ export function heartbeatService(
       agentId: agent.id,
       targetIsRemote: false,
       selectedSkillKeys: selected,
-      // Runtime materialization reads skill files outside the lock. Until its
-      // source revision has an in-lock authority, keep a selected skill
-      // requirement unknown rather than certifying a stale file.
-      skillSelectionsVerified: false,
+      skillSelectionsVerified: true,
+      unverifiedSkillKeys,
       agentPermissionKeys: allowedAgentPermissionKeys,
       managedMcpToolNames: tools.allowedToolNames,
       }),
@@ -17176,7 +17200,7 @@ export function heartbeatService(
     snapshot: CapabilityPreflightSnapshot | null,
   ): Promise<boolean> {
     if (!snapshot) return true;
-    const [issue, currentAgent, tools, allowedAgentPermissionKeys] = await Promise.all([
+    const [issue, currentAgent, tools, allowedAgentPermissionKeys, skillRows, skillVersions] = await Promise.all([
       tx.select({ executionPolicy: issues.executionPolicy, updatedAt: issues.updatedAt })
         .from(issues)
         .where(and(eq(issues.id, snapshot.issueId), eq(issues.companyId, run.companyId)))
@@ -17196,8 +17220,23 @@ export function heartbeatService(
           permissionKey as PermissionKey,
         )) ? permissionKey : null,
       )).then((keys) => keys.filter((key): key is string => key !== null)),
+      snapshot.skillRevisions.length === 0
+        ? Promise.resolve([])
+        : tx.select({ id: companySkillsTable.id, key: companySkillsTable.key, currentVersionId: companySkillsTable.currentVersionId })
+          .from(companySkillsTable)
+          .where(and(eq(companySkillsTable.companyId, run.companyId), inArray(companySkillsTable.key, snapshot.skillRevisions.map((skill) => skill.key)))),
+      snapshot.skillRevisions.length === 0
+        ? Promise.resolve([])
+        : tx.select({ id: companySkillVersions.id, companySkillId: companySkillVersions.companySkillId })
+          .from(companySkillVersions)
+          .where(and(eq(companySkillVersions.companyId, run.companyId), inArray(companySkillVersions.id, snapshot.skillRevisions.map((skill) => skill.versionId)))),
     ]);
     if (!issue || !currentAgent) return false;
+    if (snapshot.skillRevisions.some((skill) => {
+      const row = skillRows.find((candidate) => candidate.key === skill.key);
+      return !row || row.currentVersionId !== skill.currentVersionId ||
+        !skillVersions.some((version) => version.id === skill.versionId && version.companySkillId === row.id);
+    })) return false;
     return capabilityPreflightSnapshotIsCurrent(snapshot, {
       issueId: snapshot.issueId,
       agentId: agent.id,
@@ -17214,6 +17253,7 @@ export function heartbeatService(
         entries: tools.entries.map((entry) => [entry.id, entry.updatedAt.toISOString()]).sort(),
         bindings: tools.bindings.map((binding) => [binding.id, binding.updatedAt.toISOString()]).sort(),
       }),
+      skillRevisions: snapshot.skillRevisions,
     });
   }
 

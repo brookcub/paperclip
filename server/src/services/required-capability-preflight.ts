@@ -26,6 +26,7 @@ export type CapabilityPreflightSnapshot = {
   permissionKeys: string[];
   allowedAgentPermissionKeys: string[];
   managedMcpRevision: string;
+  skillRevisions: Array<{ key: string; versionId: string; currentVersionId: string | null }>;
 };
 
 export type CapabilityPreflight = {
@@ -57,7 +58,8 @@ export function capabilityPreflightSnapshotIsCurrent(
     snapshot.permissionKeys.every((key, index) => key === current.permissionKeys[index]) &&
     snapshot.allowedAgentPermissionKeys.length === current.allowedAgentPermissionKeys.length &&
     snapshot.allowedAgentPermissionKeys.every((key, index) => key === current.allowedAgentPermissionKeys[index]) &&
-    snapshot.managedMcpRevision === current.managedMcpRevision;
+    snapshot.managedMcpRevision === current.managedMcpRevision &&
+    stableCapabilitySnapshot(snapshot.skillRevisions) === stableCapabilitySnapshot(current.skillRevisions);
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -109,10 +111,12 @@ export function evaluateRequiredCapabilities(input: {
   targetIsRemote: boolean;
   selectedSkillKeys: Iterable<string>;
   skillSelectionsVerified: boolean;
+  unverifiedSkillKeys?: Iterable<string>;
   agentPermissionKeys: Iterable<string>;
   managedMcpToolNames: Iterable<string>;
 }): CapabilityPreflightResult {
   const skills = new Set(input.selectedSkillKeys);
+  const unverifiedSkills = new Set(input.unverifiedSkillKeys ?? []);
   const permissions = new Set(input.agentPermissionKeys);
   const mcp = new Set(input.managedMcpToolNames);
   const unmet: CapabilityPreflightResult["unmet"] = [];
@@ -130,7 +134,9 @@ export function evaluateRequiredCapabilities(input: {
       continue;
     }
     if (requirement.kind === "skill") {
-      if (!skills.has(requirement.key)) unmet.push({ id, state: "missing", reason: "skill_not_selected" });
+      if (!skills.has(requirement.key) && unverifiedSkills.has(requirement.key)) {
+        unmet.push({ id, state: "unknown", reason: "skill_version_not_pinned" });
+      } else if (!skills.has(requirement.key)) unmet.push({ id, state: "missing", reason: "skill_not_selected" });
       else if (!input.skillSelectionsVerified) unmet.push({ id, state: "unknown", reason: "skill_revision_not_rechecked" });
       continue;
     }
