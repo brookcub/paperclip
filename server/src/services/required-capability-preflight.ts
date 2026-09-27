@@ -26,7 +26,7 @@ export type CapabilityPreflightSnapshot = {
   permissionKeys: string[];
   allowedAgentPermissionKeys: string[];
   managedMcpRevision: string;
-  skillRevisions: Array<{ key: string; versionId: string; currentVersionId: string | null }>;
+  skillRevisions: Array<{ key: string; versionId: string | null; currentVersionId: string | null }>;
   skillVersionPinsEnabled: boolean | null;
 };
 

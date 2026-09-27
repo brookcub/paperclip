@@ -17144,7 +17144,7 @@ export function heartbeatService(
         bindings: tools.bindings.map((binding) => [binding.id, binding.updatedAt.toISOString()]).sort(),
       }),
       skillRevisions: [],
-      skillVersionPinsEnabled: false,
+      skillVersionPinsEnabled: null,
     };
     // Dispatch applies an issue override and mention-scoped keys later. Do not
     // certify the agent default when either would change that effective input.
@@ -17167,20 +17167,18 @@ export function heartbeatService(
     }
     const config = parseObject(agent.adapterConfig);
     const preference = readPaperclipSkillSyncPreference(config);
-    const skillVersionPinsEnabled = (await instanceSettings.get()).experimental.enableBetaSkills === true;
-    snapshot.skillVersionPinsEnabled = skillVersionPinsEnabled;
     // This is phase A: it uses the same delivery resolver as dispatch, before
     // any run-start mutation. Materialization is deliberately outside locks.
     const entries = await companySkills.listRuntimeSkillEntries(agent.companyId, {
       versionSelections: skillVersionSelectionMap(preference.desiredSkillEntries, {
-        versionPinsEnabled: skillVersionPinsEnabled,
+        versionPinsEnabled: false,
       }),
     });
     const desiredSkillKeys = resolveLegacyPaperclipDesiredSkillNames(config, entries);
     const verifiedSkillEntries = desiredSkillKeys.flatMap((key) => {
       const entry = entries.find((candidate) => candidate.key === key);
-      return entry?.sourceStatus === "available" && entry.versionId
-        ? [{ key, versionId: entry.versionId, currentVersionId: entry.currentVersionId ?? null }]
+      return entry?.sourceStatus === "available"
+        ? [{ key, versionId: entry.versionId ?? null, currentVersionId: entry.currentVersionId ?? null }]
         : [];
     });
     const selected = verifiedSkillEntries.map((entry) => entry.key);
@@ -17239,14 +17237,14 @@ export function heartbeatService(
         ? Promise.resolve([])
         : tx.select({ id: companySkillVersions.id, companySkillId: companySkillVersions.companySkillId })
           .from(companySkillVersions)
-          .where(and(eq(companySkillVersions.companyId, run.companyId), inArray(companySkillVersions.id, snapshot.skillRevisions.map((skill) => skill.versionId)))),
+          .where(and(eq(companySkillVersions.companyId, run.companyId), inArray(companySkillVersions.id, snapshot.skillRevisions.flatMap((skill) => skill.versionId ? [skill.versionId] : [])))),
       instanceSettingsService(tx).get(),
     ]);
     if (!issue || !currentAgent) return false;
     if (snapshot.skillRevisions.some((skill) => {
       const row = skillRows.find((candidate) => candidate.key === skill.key);
       return !row || row.currentVersionId !== skill.currentVersionId ||
-        !skillVersions.some((version) => version.id === skill.versionId && version.companySkillId === row.id);
+        (skill.versionId !== null && !skillVersions.some((version) => version.id === skill.versionId && version.companySkillId === row.id));
     })) return false;
     return capabilityPreflightSnapshotIsCurrent(snapshot, {
       issueId: snapshot.issueId,
