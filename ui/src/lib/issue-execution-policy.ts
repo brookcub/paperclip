@@ -82,7 +82,7 @@ export function buildExecutionPolicy(input: {
   approverValues: string[];
   monitor?: IssueExecutionPolicy["monitor"];
 }): IssueExecutionPolicy | null {
-  const { monitor: existingMonitor, ...existingPolicy } = input.existingPolicy ?? {};
+  const { monitor: existingMonitor, ...existingPolicy }: Partial<IssueExecutionPolicy> = input.existingPolicy ?? {};
   const mode = existingPolicy.mode ?? "normal";
   const stages: IssueExecutionPolicy["stages"] = [];
   // Omitted preserves the schedule; explicit null removes it from the replacement policy.

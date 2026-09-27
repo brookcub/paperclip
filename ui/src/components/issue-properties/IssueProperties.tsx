@@ -10,6 +10,7 @@ import {
   isArtifactReviewDocumentKey,
   type ExecutionWorkspace,
   type Issue,
+  type IssueExecutionPolicy,
   type IssueLabel,
 } from "@paperclipai/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -1248,11 +1249,7 @@ export function IssueProperties({
     </div>
   );
 
-  const updateMonitor = (nextMonitor: Issue["executionPolicy"] extends infer T
-    ? T extends { monitor?: infer M | null } | null | undefined
-      ? M | null
-      : never
-    : never) => {
+  const updateMonitor = (nextMonitor: IssueExecutionPolicy["monitor"]) => {
     onUpdate({
       executionPolicy: buildExecutionPolicy({
         existingPolicy: issue.executionPolicy ?? null,
