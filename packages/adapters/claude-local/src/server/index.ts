@@ -17,6 +17,10 @@ export {
   isClaudeUnknownSessionError,
 } from "./parse.js";
 export {
+  captureClaudeTranscriptCompletionEvidence,
+  type ClaudeTranscriptCompletionEvidence,
+} from "./completion-evidence.js";
+export {
   getQuotaWindows,
   readClaudeAuthStatus,
   readClaudeToken,

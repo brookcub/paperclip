@@ -438,6 +438,10 @@ import {
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 import {
+  buildRunCompletionEvidence,
+  persistCompletionEvidenceBeforeScratchCleanup,
+} from "./run-completion-evidence.js";
+import {
   applyDefaultIsolatedExecutionWorkspacePolicy,
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
@@ -606,11 +610,11 @@ import {
 } from "./effective-run-config-fingerprints.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { serverVersion } from "../version.js";
+import { boundHeartbeatRunEventPayloadForStorage } from "./run-event-payload-bounds.js";
+export { boundHeartbeatRunEventPayloadForStorage } from "./run-event-payload-bounds.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
-const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
-const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 
 export function redactDetectedSuccessfulRunProgressSummaryForBoard(
   summary: string,
@@ -633,8 +637,6 @@ export function redactSuccessfulRunHandoffEvidence(
   );
 }
 
-const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
-const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
@@ -3479,89 +3481,6 @@ const heartbeatRunIssueSummaryColumns = {
 
 function appendExcerpt(prev: string, chunk: string) {
   return appendWithByteCap(prev, chunk, MAX_EXCERPT_BYTES);
-}
-
-function truncateRunEventString(value: string) {
-  if (value.length <= MAX_RUN_EVENT_PAYLOAD_STRING_CHARS) return value;
-  const omittedChars = value.length - MAX_RUN_EVENT_PAYLOAD_STRING_CHARS;
-  return `${value.slice(0, MAX_RUN_EVENT_PAYLOAD_STRING_CHARS)}\n[truncated ${omittedChars} chars]`;
-}
-
-function boundRunEventValue(
-  value: unknown,
-  depth: number,
-  seen: WeakSet<object>,
-): unknown {
-  if (typeof value === "string") {
-    return truncateRunEventString(value);
-  }
-  if (
-    value === null ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return value;
-  }
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  if (Array.isArray(value)) {
-    if (depth >= MAX_RUN_EVENT_PAYLOAD_DEPTH) {
-      return {
-        _truncated: true,
-        type: "array",
-        originalLength: value.length,
-      };
-    }
-    const bounded = value
-      .slice(0, MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS)
-      .map((entry) => boundRunEventValue(entry, depth + 1, seen));
-    if (value.length > MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS) {
-      bounded.push({
-        _truncated: true,
-        omittedItems: value.length - MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS,
-      });
-    }
-    return bounded;
-  }
-  if (typeof value !== "object" || value === undefined) {
-    return null;
-  }
-  if (seen.has(value)) {
-    return "[Circular]";
-  }
-  seen.add(value);
-  const entries = Object.entries(value as Record<string, unknown>);
-  if (depth >= MAX_RUN_EVENT_PAYLOAD_DEPTH) {
-    const bounded = {
-      _truncated: true,
-      type: "object",
-      keys: entries.map(([key]) => key).slice(0, 20),
-    };
-    seen.delete(value);
-    return bounded;
-  }
-
-  const out: Record<string, unknown> = {};
-  for (const [key, entryValue] of entries.slice(
-    0,
-    MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS,
-  )) {
-    out[key] = boundRunEventValue(entryValue, depth + 1, seen);
-  }
-  if (entries.length > MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS) {
-    out._truncated = true;
-    out._omittedKeys = entries.length - MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS;
-  }
-  seen.delete(value);
-  return out;
-}
-
-export function boundHeartbeatRunEventPayloadForStorage(
-  payload: Record<string, unknown>,
-): Record<string, unknown> {
-  const bounded = boundRunEventValue(payload, 0, new WeakSet());
-  return parseObject(bounded) ?? { _truncated: true };
 }
 
 function redactInlineBase64ImageData(chunk: string) {
@@ -19795,6 +19714,8 @@ export function heartbeatService(
       ReturnType<typeof traceStore.prepare>
     > | null = null;
     let providerTraceFinalized = false;
+    let providerTraceRequested = false;
+    let completionEvidenceAdapterType: string | null = null;
 
     try {
       const agent = await getAgent(run.agentId);
@@ -19812,6 +19733,7 @@ export function heartbeatService(
         if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
         return;
       }
+      completionEvidenceAdapterType = agent.adapterType;
 
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
@@ -19863,8 +19785,7 @@ export function heartbeatService(
       // Reviewed chat turns rebuild it from the current durable owner below.
       delete context[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
       delete context[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY];
-      const providerTraceRequested =
-        parseObject(context.debug).providerTrace === "raw";
+      providerTraceRequested = parseObject(context.debug).providerTrace === "raw";
       if (providerTraceRequested) {
         if (context.providerTraceRequestSource === "agent_debug_setting") {
           try {
@@ -25550,46 +25471,87 @@ export function heartbeatService(
           }
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
         }
-        if (
-          runScratch &&
-          latestRun &&
-          isHeartbeatRunTerminalStatus(latestRun.status)
-        ) {
+        if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
+          const terminalRun = latestRun;
+          const providerTrace = await traceStore
+            .getByRun(terminalRun.id, run.companyId)
+            .catch((error) => {
+              logger.warn(
+                { err: error, runId: run.id },
+                "provider trace metadata was unavailable for completion evidence",
+              );
+              return null;
+            });
+          const completionEvidence = buildRunCompletionEvidence({
+            adapterType: completionEvidenceAdapterType,
+            adapterResultJson: terminalRun.resultJson,
+            providerTrace,
+            providerTraceRequested,
+          });
           const scratchForCleanup = runScratch;
           let scratchCleanup: Awaited<
             ReturnType<typeof cleanupHeartbeatRunScratch>
           > | null = null;
+
           try {
-            scratchCleanup = await cleanupHeartbeatRunScratch({
-              scratch: scratchForCleanup,
-              processGroupId: latestRun.processGroupId,
-              isProcessGroupAlive,
+            scratchCleanup = await persistCompletionEvidenceBeforeScratchCleanup({
+              append: () =>
+                appendRunEvent(terminalRun, {
+                  eventType: "completion_evidence",
+                  stream: "system",
+                  level: "info",
+                  message: "run completion evidence recorded before scratch cleanup",
+                  payload: completionEvidence,
+                }),
+              cleanup: scratchForCleanup
+                ? async () => {
+                    try {
+                      return await cleanupHeartbeatRunScratch({
+                        scratch: scratchForCleanup,
+                        processGroupId: terminalRun.processGroupId,
+                        isProcessGroupAlive,
+                      });
+                    } catch (scratchCleanupError) {
+                      logger.warn(
+                        {
+                          err: scratchCleanupError,
+                          runId: run.id,
+                          scratchDir: scratchForCleanup.dir,
+                        },
+                        "failed to clean heartbeat run scratch directory",
+                      );
+                      await appendRunEvent(terminalRun, {
+                        eventType: "error",
+                        stream: "system",
+                        level: "warn",
+                        message: "run scratch cleanup failed",
+                        payload: {
+                          dir: scratchForCleanup.dir,
+                          error:
+                            scratchCleanupError instanceof Error
+                              ? scratchCleanupError.message
+                              : String(scratchCleanupError),
+                        },
+                      }).catch(() => undefined);
+                      return null;
+                    }
+                  }
+                : undefined,
             });
-          } catch (scratchCleanupError) {
-            logger.warn(
+          } catch (completionEvidenceError) {
+            // Do not clean scratch when the durable evidence event failed: the
+            // CLI transcript remains the recovery source for a later operator.
+            logger.error(
               {
-                err: scratchCleanupError,
+                err: completionEvidenceError,
                 runId: run.id,
-                scratchDir: scratchForCleanup.dir,
+                scratchDir: scratchForCleanup?.dir,
               },
-              "failed to clean heartbeat run scratch directory",
+              "completion evidence persistence failed; retaining heartbeat run scratch",
             );
-            await appendRunEvent(latestRun, {
-              eventType: "error",
-              stream: "system",
-              level: "warn",
-              message: "run scratch cleanup failed",
-              payload: {
-                dir: scratchForCleanup.dir,
-                error:
-                  scratchCleanupError instanceof Error
-                    ? scratchCleanupError.message
-                    : String(scratchCleanupError),
-              },
-            }).catch(() => undefined);
           }
           if (scratchCleanup) {
-            await appendRunEvent(latestRun, {
+            await appendRunEvent(terminalRun, {
               eventType: "lifecycle",
               stream: "system",
               level: scratchCleanup.removed ? "info" : "warn",
@@ -25602,7 +25564,7 @@ export function heartbeatService(
                 {
                   err: scratchCleanupEventError,
                   runId: run.id,
-                  scratchDir: scratchForCleanup.dir,
+                  scratchDir: scratchForCleanup?.dir,
                 },
                 "failed to record heartbeat run scratch cleanup event",
               );

@@ -93,6 +93,7 @@ import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
+import { captureClaudeTranscriptCompletionEvidence } from "./completion-evidence.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
   createClaudeAcpExecutor,
@@ -996,7 +997,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
-    return { proc, parsedStream, parsed };
+    const completionEvidence = executionTargetIsRemote
+      ? {
+          schema: "paperclip.claude-transcript-completion-evidence.v1" as const,
+          status: "unavailable" as const,
+          source: "claude_config_transcript" as const,
+          sessionId: parsedStream.sessionId,
+          toolSchemaProjection: "prompt_snapshot_safe_structure.v1" as const,
+          files: [],
+          parseGaps: ["remote_claude_config_unreadable"],
+        }
+      : await captureClaudeTranscriptCompletionEvidence({
+          configDir: env.CLAUDE_CONFIG_DIR,
+          sessionId: parsedStream.sessionId ?? (asString(parsed?.session_id, "") || null),
+        });
+    return { proc, parsedStream, parsed, completionEvidence };
   };
 
   const toAdapterResult = (
@@ -1004,6 +1019,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       proc: RunProcessResult;
       parsedStream: ReturnType<typeof parseClaudeStreamJson>;
       parsed: Record<string, unknown> | null;
+      completionEvidence: Awaited<ReturnType<typeof captureClaudeTranscriptCompletionEvidence>>;
     },
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
@@ -1094,6 +1110,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
+          completionEvidence: attempt.completionEvidence,
           ...(errorFamily ? { errorFamily } : {}),
           ...(transientRetryNotBefore
             ? { retryNotBefore: transientRetryNotBefore.toISOString() }
@@ -1242,6 +1259,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
+      completionEvidence: attempt.completionEvidence,
     };
 
     return {
