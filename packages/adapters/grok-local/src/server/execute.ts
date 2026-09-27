@@ -368,10 +368,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         detectCommand: ctx.runtimeCommandSpec?.detectCommand ?? command,
         onProgress: (line) => onLog("stdout", line),
         onRuntimeProgress: ctx.onRuntimeProgress,
-        assets: wakePayloadTransport.asset || stagedGrokHomeDir
-          ? [
-              ...(wakePayloadTransport.asset ? [wakePayloadTransport.asset] : []),
-              {
+        assets: [
+          ...(wakePayloadTransport.asset ? [wakePayloadTransport.asset] : []),
+          ...(stagedGrokHomeDir ? [{
                 key: "home",
                 localDir: stagedGrokHomeDir,
                 followSymlinks: true,
@@ -391,9 +390,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                     log: (line) => onLog("stdout", `${line}\n`),
                     env: process.env,
                   }).catch(() => undefined)),
-              },
-            ]
-          : wakePayloadTransport.asset ? [wakePayloadTransport.asset] : undefined,
+          }] : []),
+        ],
       });
       restoreRemoteWorkspace = () =>
         preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line));

@@ -431,10 +431,8 @@ import {
   isRuntimeOwnedGitBranch,
 } from "./execution-workspace-branch-ownership.js";
 import {
-  HEARTBEAT_RUN_SCRATCH_MARKER,
-  buildHeartbeatRunScratchEnv,
   cleanupHeartbeatRunScratch,
-  prepareHeartbeatRunScratch,
+  prepareHeartbeatRunScratchForExecution,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 import {
@@ -21845,49 +21843,40 @@ export function heartbeatService(
         }
         return { dispatched: false };
       };
-      if (!executionTarget || executionTarget.kind === "local") {
-        try {
-          runScratch = await prepareHeartbeatRunScratch({
-            companyId: agent.companyId,
-            agentId: agent.id,
-            runId: run.id,
-            issueId: issueRef?.id ?? null,
-            issueIdentifier: issueRef?.identifier ?? null,
-          });
+      try {
+        const scratchPreparation = await prepareHeartbeatRunScratchForExecution({
+          companyId: agent.companyId,
+          agentId: agent.id,
+          runId: run.id,
+          issueId: issueRef?.id ?? null,
+          issueIdentifier: issueRef?.identifier ?? null,
+          executionTargetIsLocal: !executionTarget || executionTarget.kind === "local",
+          existingEnv: parseObject(runtimeConfig.env),
+        });
+        runScratch = scratchPreparation.scratch;
+        context.paperclipScratch = scratchPreparation.context;
+        if (!executionTarget || executionTarget.kind === "local") {
           const existingRuntimeEnv = parseObject(runtimeConfig.env);
-          const scratchEnv = buildHeartbeatRunScratchEnv(
-            existingRuntimeEnv,
-            runScratch,
-          );
           runtimeConfig = {
             ...runtimeConfig,
             env: {
               ...existingRuntimeEnv,
-              ...scratchEnv.env,
+              ...scratchPreparation.env,
             },
           };
-          context.paperclipScratch = {
-            type: "heartbeat_run",
-            dir: runScratch.dir,
-            cleanupPolicy: "terminal_run",
-            marker: HEARTBEAT_RUN_SCRATCH_MARKER,
-            tempKeysApplied: scratchEnv.tempKeysApplied,
-          };
-        } catch (scratchPrepareError) {
-          runScratch = null;
-          delete context.paperclipScratch;
-          logger.warn(
-            {
-              err: scratchPrepareError,
-              runId: run.id,
-              issueId,
-              agentId: agent.id,
-            },
-            "failed to prepare heartbeat run scratch directory; continuing without scratch env",
-          );
         }
-      } else {
+      } catch (scratchPrepareError) {
+        runScratch = null;
         delete context.paperclipScratch;
+        logger.warn(
+          {
+            err: scratchPrepareError,
+            runId: run.id,
+            issueId,
+            agentId: agent.id,
+          },
+          "failed to prepare heartbeat run scratch directory; continuing without scratch env",
+        );
       }
       const gitExecutionEnv = await prepareGitHubExecutionEnvironment({
         target: executionTarget,

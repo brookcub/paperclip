@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -42,10 +42,17 @@ import {
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
 
+async function createDirectoryLink(target: string, link: string) {
+  await fs.symlink(target, link, process.platform === "win32" ? "junction" : "dir");
+}
+
 describe("wake payload environment transport", () => {
   it("keeps small JSON inline and clears stale alternate transport values", async () => {
     const transport = await preparePaperclipWakePayloadTransport({
-      wake: { reason: "issue_commented", commentWindow: {} },
+      wake: {
+        reason: "issue_commented",
+        issue: { id: "issue-1", identifier: "PAP-1", title: "wake", status: "in_progress", workMode: "standard" },
+      },
       scratch: null,
       companyId: "company-1",
       agentId: "agent-1",
@@ -79,11 +86,18 @@ describe("wake payload environment transport", () => {
         commentWindow: { requestedCount: 1, includedCount: 1, missingCount: 0 },
       };
       const expected = stringifyPaperclipWakePayload(wake);
-      expect(expected?.length).toBeGreaterThan(MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS);
-      expect(Buffer.byteLength(expected ?? "", "utf8")).toBeGreaterThan(72_000);
-
+      expect(expected).not.toBeNull();
       const transport = await preparePaperclipWakePayloadTransport({ wake, scratch: { type: "heartbeat_run", dir: scratchDir, marker: ".paperclip-run-scratch.json" }, ...owner });
       expect(transport.asset?.key).toBe("wake-payload");
+      const materialized = await fs.readFile(path.join(transport.asset!.localDir, "payload.json"), "utf8");
+      expect(materialized.length).toBeGreaterThan(MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS);
+      expect(Buffer.byteLength(materialized, "utf8")).toBeGreaterThan(72_000);
+      expect(createHash("sha256").update(materialized, "utf8").digest("hex")).toBe(
+        createHash("sha256").update(expected!, "utf8").digest("hex"),
+      );
+      expect((JSON.parse(materialized) as { comments: Array<{ body: string }> }).comments[0]?.body).toBe(
+        wake.comments[0]?.body,
+      );
 
       const remoteEnv: Record<string, string> = { [PAPERCLIP_WAKE_PAYLOAD_JSON_ENV]: "stale" };
       transport.applyToEnv(remoteEnv, { remote: true, remoteAssetDir: "/run/.paperclip-runtime/claude/wake-payload" });
@@ -91,7 +105,7 @@ describe("wake payload environment transport", () => {
 
       const env: Record<string, string> = { KEEP_ENV: "unchanged", [PAPERCLIP_WAKE_PAYLOAD_JSON_ENV]: "stale", [PAPERCLIP_WAKE_PAYLOAD_PATH_ENV]: "stale" };
       transport.applyToEnv(env);
-      const script = "const fs=require('node:fs');process.stdout.write(JSON.stringify({keep:process.env.KEEP_ENV,inline:process.env.PAPERCLIP_WAKE_PAYLOAD_JSON,path:process.env.PAPERCLIP_WAKE_PAYLOAD_PATH,payload:fs.readFileSync(process.env.PAPERCLIP_WAKE_PAYLOAD_PATH,'utf8')}));";
+      const script = "const crypto=require('node:crypto'),fs=require('node:fs');const payload=fs.readFileSync(process.env.PAPERCLIP_WAKE_PAYLOAD_PATH,'utf8');process.stdout.write(JSON.stringify({keep:process.env.KEEP_ENV,inline:process.env.PAPERCLIP_WAKE_PAYLOAD_JSON,path:process.env.PAPERCLIP_WAKE_PAYLOAD_PATH,payloadBytes:Buffer.byteLength(payload,'utf8'),payloadHash:crypto.createHash('sha256').update(payload,'utf8').digest('hex')}));";
       const inheritedJson = process.env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV];
       const inheritedPath = process.env[PAPERCLIP_WAKE_PAYLOAD_PATH_ENV];
       try {
@@ -105,10 +119,11 @@ describe("wake payload environment transport", () => {
           onLog: async () => {},
         });
         expect(result.exitCode).toBe(0);
-        const child = JSON.parse(result.stdout) as Record<string, string | undefined>;
+        const child = JSON.parse(result.stdout) as Record<string, string | number | undefined>;
         expect(child.keep).toBe("unchanged");
         expect(child.inline).toBeUndefined();
-        expect(child.payload).toBe(expected);
+        expect(child.payloadBytes).toBe(Buffer.byteLength(expected!, "utf8"));
+        expect(child.payloadHash).toBe(createHash("sha256").update(expected!, "utf8").digest("hex"));
       } finally {
         if (inheritedJson === undefined) delete process.env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV];
         else process.env[PAPERCLIP_WAKE_PAYLOAD_JSON_ENV] = inheritedJson;
@@ -120,22 +135,24 @@ describe("wake payload environment transport", () => {
     }
   });
 
-  it("refuses a mismatched owner marker or a marker link", async () => {
+  it("refuses a mismatched owner marker or a linked scratch directory", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-wake-ownership-"));
+    const linkedScratch = `${root}-link`;
+    const linkedTarget = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-wake-link-target-"));
     const owner = { companyId: "company-1", agentId: "agent-1", runId: "run-1" };
-    const wake = { reason: "issue_commented", comments: [{ id: "comment-1", body: "x".repeat(10_000), author: { type: "user", id: "user-1" }, createdAt: "2026-09-26T00:00:00.000Z" }] };
+    const wake = { reason: "issue_commented", issue: { id: "issue-1", identifier: "PAP-1", title: "wake", status: "in_progress", workMode: "standard" }, comments: [{ id: "comment-1", body: "x".repeat(10_000), author: { type: "user", id: "user-1" }, createdAt: "2026-09-26T00:00:00.000Z" }] };
     const markerPath = path.join(root, ".paperclip-run-scratch.json");
     try {
       await fs.writeFile(markerPath, JSON.stringify({ version: 1, ...owner, agentId: "other-agent", createdAt: new Date().toISOString() }));
       await expect(preparePaperclipWakePayloadTransport({ wake, scratch: { type: "heartbeat_run", dir: root, marker: ".paperclip-run-scratch.json" }, ...owner })).rejects.toThrow("ownership");
 
-      await fs.rm(markerPath);
-      const markerTarget = path.join(root, "marker-target.json");
-      await fs.writeFile(markerTarget, JSON.stringify({ version: 1, ...owner, createdAt: new Date().toISOString() }));
-      await fs.symlink(markerTarget, markerPath, "file");
-      await expect(preparePaperclipWakePayloadTransport({ wake, scratch: { type: "heartbeat_run", dir: root, marker: ".paperclip-run-scratch.json" }, ...owner })).rejects.toThrow("valid server-owned");
+      await fs.writeFile(path.join(linkedTarget, ".paperclip-run-scratch.json"), JSON.stringify({ version: 1, ...owner, createdAt: new Date().toISOString() }));
+      await createDirectoryLink(linkedTarget, linkedScratch);
+      await expect(preparePaperclipWakePayloadTransport({ wake, scratch: { type: "heartbeat_run", dir: linkedScratch, marker: ".paperclip-run-scratch.json" }, ...owner })).rejects.toThrow("valid server-owned");
     } finally {
       await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(linkedScratch, { recursive: true, force: true });
+      await fs.rm(linkedTarget, { recursive: true, force: true });
     }
   });
 });

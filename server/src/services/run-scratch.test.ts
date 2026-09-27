@@ -3,10 +3,17 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS,
+  PAPERCLIP_WAKE_PAYLOAD_JSON_ENV,
+  PAPERCLIP_WAKE_PAYLOAD_PATH_ENV,
+  preparePaperclipWakePayloadTransport,
+} from "@paperclipai/adapter-utils/server-utils";
+import {
   HEARTBEAT_RUN_SCRATCH_MARKER,
   buildHeartbeatRunScratchEnv,
   cleanupHeartbeatRunScratch,
   prepareHeartbeatRunScratch,
+  prepareHeartbeatRunScratchForExecution,
   type HeartbeatRunScratch,
 } from "./run-scratch.js";
 
@@ -121,5 +128,56 @@ describe("heartbeat run scratch cleanup", () => {
     expect(result.env.TEMP).toBe(scratch.dir);
     expect(result.env.TMP).toBe(scratch.dir);
     expect(result.tempKeysApplied).toEqual(["TEMP", "TMP"]);
+  });
+
+  it("keeps remote temp settings while supplying an owned scratch payload for remote staging", async () => {
+    const preparation = await prepareHeartbeatRunScratchForExecution({
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+      executionTargetIsLocal: false,
+      existingEnv: { TMPDIR: "/remote/tmp", TEMP: "/remote/temp", TMP: "/remote/tmp-win" },
+    });
+    await trackScratch(preparation.scratch);
+    expect(preparation.env).toEqual({});
+    expect(preparation.context).toMatchObject({
+      type: "heartbeat_run",
+      dir: preparation.scratch.dir,
+      marker: HEARTBEAT_RUN_SCRATCH_MARKER,
+      tempKeysApplied: [],
+    });
+
+    const wake = {
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "wake", status: "in_progress", workMode: "standard" },
+      comments: [{ id: "comment-1", body: "😀".repeat(5_000), author: { type: "user", id: "user-1" }, createdAt: "2026-09-26T00:00:00.000Z" }],
+    };
+    const transport = await preparePaperclipWakePayloadTransport({
+      wake,
+      scratch: preparation.context,
+      companyId: "company-1",
+      agentId: "agent-1",
+      runId: "run-1",
+    });
+    expect(transport.asset).toMatchObject({ key: "wake-payload", localDir: expect.stringContaining(preparation.scratch.dir) });
+    const stagedPayload = await fs.readFile(path.join(transport.asset!.localDir, "payload.json"), "utf8");
+    expect(stagedPayload.length).toBeGreaterThan(MAX_INLINE_PAPERCLIP_WAKE_PAYLOAD_UTF16_CODE_UNITS);
+
+    const remoteEnv = {
+      TMPDIR: "/remote/tmp",
+      TEMP: "/remote/temp",
+      TMP: "/remote/tmp-win",
+      [PAPERCLIP_WAKE_PAYLOAD_JSON_ENV]: "stale-inline",
+    };
+    transport.applyToEnv(remoteEnv, {
+      remote: true,
+      remoteAssetDir: "/remote/.paperclip-runtime/claude/wake-payload",
+    });
+    expect(remoteEnv).toEqual({
+      TMPDIR: "/remote/tmp",
+      TEMP: "/remote/temp",
+      TMP: "/remote/tmp-win",
+      [PAPERCLIP_WAKE_PAYLOAD_PATH_ENV]: "/remote/.paperclip-runtime/claude/wake-payload/payload.json",
+    });
   });
 });

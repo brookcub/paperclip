@@ -25,6 +25,18 @@ export interface HeartbeatRunScratchEnvResult {
   tempKeysApplied: string[];
 }
 
+export interface HeartbeatRunScratchPreparation {
+  scratch: HeartbeatRunScratch;
+  context: {
+    type: "heartbeat_run";
+    dir: string;
+    cleanupPolicy: "terminal_run";
+    marker: typeof HEARTBEAT_RUN_SCRATCH_MARKER;
+    tempKeysApplied: string[];
+  };
+  env: Record<string, string>;
+}
+
 export type HeartbeatRunScratchCleanupResult =
   | { removed: true; dir: string }
   | { removed: false; dir: string; reason: "missing" | "unmarked" | "owner_mismatch" | "process_group_alive" };
@@ -120,6 +132,28 @@ export function buildHeartbeatRunScratchEnv(
     tempKeysApplied.push(key);
   }
   return { env, tempKeysApplied };
+}
+
+/** Prepares controller-owned staging for every target, but only exports it to local children. */
+export async function prepareHeartbeatRunScratchForExecution(input: Parameters<typeof prepareHeartbeatRunScratch>[0] & {
+  executionTargetIsLocal: boolean;
+  existingEnv: Record<string, unknown>;
+}): Promise<HeartbeatRunScratchPreparation> {
+  const scratch = await prepareHeartbeatRunScratch(input);
+  const scratchEnv = input.executionTargetIsLocal
+    ? buildHeartbeatRunScratchEnv(input.existingEnv, scratch)
+    : { env: {}, tempKeysApplied: [] };
+  return {
+    scratch,
+    context: {
+      type: "heartbeat_run",
+      dir: scratch.dir,
+      cleanupPolicy: "terminal_run",
+      marker: HEARTBEAT_RUN_SCRATCH_MARKER,
+      tempKeysApplied: scratchEnv.tempKeysApplied,
+    },
+    env: scratchEnv.env,
+  };
 }
 
 export async function cleanupHeartbeatRunScratch(input: {
