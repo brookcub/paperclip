@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -82,6 +83,17 @@ const serializedServerVitestArgs = [
   "--maxWorkers=1",
 ];
 const sourceOnlyVitestArgs = ["--exclude", "**/dist/**"];
+
+// `pnpm` is a .cmd shim on Windows, which Node cannot spawn without a shell.
+// A shell is not viable here because this runner can exceed cmd.exe's command
+// length limit and must pass glob arguments literally to Vitest. Resolve
+// lazily: --dry-run intentionally works without Vitest installed.
+const require = createRequire(import.meta.url);
+let cachedVitestCli = null;
+function resolveVitestCli() {
+  cachedVitestCli ??= path.join(path.dirname(require.resolve("vitest/package.json")), "vitest.mjs");
+  return cachedVitestCli;
+}
 
 function walk(dir) {
   const entries = readdirSync(dir);
@@ -300,7 +312,7 @@ function runVitest(args, label, testShard = null) {
   if (testShard) {
     const collect = (filters, name) => {
       const output = path.join(testRoot, `${name}.json`);
-      const result = spawnSync("pnpm", ["exec", "vitest", "list", ...sourceOnlyVitestArgs,
+      const result = spawnSync(process.execPath, [resolveVitestCli(), "list", ...sourceOnlyVitestArgs,
         ...filters, "--allowOnly=false", "--includeTaskLocation", `--json=${output}`], {
         cwd: repoRoot, env, stdio: "inherit",
       });
@@ -316,7 +328,7 @@ function runVitest(args, label, testShard = null) {
     console.log(`[test:run] chat shard ${testShard.index + 1}/${testShard.count}: ${selected.tests.length}/${collected.length} tests, ${selected.lines.length} source lines; exact filter coverage verified`);
     args.push("--allowOnly=false");
   }
-  const result = spawnSync("pnpm", ["exec", "vitest", "run", ...sourceOnlyVitestArgs, ...args], {
+  const result = spawnSync(process.execPath, [resolveVitestCli(), "run", ...sourceOnlyVitestArgs, ...args], {
     cwd: repoRoot,
     env,
     stdio: "inherit",

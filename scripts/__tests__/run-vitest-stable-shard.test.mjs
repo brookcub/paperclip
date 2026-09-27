@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -35,8 +37,78 @@ function dryRunJson(args) {
   return JSON.parse(result.stdout);
 }
 
+function writeSpawnCapturePreload(directory) {
+  const preload = path.join(directory, "capture spawn with spaces.cjs");
+  writeFileSync(preload, `
+const childProcess = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const { syncBuiltinESMExports } = require("node:module");
+
+const report = process.env.PAPERCLIP_TEST_SPAWN_REPORT;
+const status = Number(process.env.PAPERCLIP_TEST_SPAWN_STATUS);
+childProcess.spawnSync = (command, args, options) => {
+  const records = fs.existsSync(report) ? JSON.parse(fs.readFileSync(report, "utf8")) : [];
+  records.push({ command, args, shell: options?.shell ?? null });
+  if (args[1] === "list") {
+    const outputArg = args.find((arg) => arg.startsWith("--json="));
+    const output = outputArg.slice("--json=".length);
+    fs.writeFileSync(output, JSON.stringify([{
+      name: "captured case",
+      file: path.join(process.cwd(), "server", "src", "__tests__", "chat-channels.integration.test.ts"),
+      projectName: "@paperclipai/server",
+      location: { line: 1, column: 1 },
+    }]));
+  }
+  fs.writeFileSync(report, JSON.stringify(records));
+  return { status: args[1] === "list" ? 0 : status };
+};
+syncBuiltinESMExports();
+`, "utf8");
+  return preload;
+}
+
 const SHARD_COUNT = 5;
 const SERIALIZED_SHARD_COUNT = 5;
+
+test("the launcher uses direct Node invocations for collection and execution", () => {
+  const fixtureRoot = mkdtempSync(path.join(os.tmpdir(), "vitest launcher space "));
+  try {
+    const probe = path.join(fixtureRoot, "literal arguments with spaces.mjs");
+    writeFileSync(probe, 'process.stdout.write(JSON.stringify(process.argv.slice(2))); process.exit(23);', "utf8");
+    const probeResult = spawnSync(process.execPath, [probe, "**/dist/**", "path with spaces"], { encoding: "utf8" });
+    assert.equal(probeResult.status, 23, probeResult.stderr);
+    assert.deepEqual(JSON.parse(probeResult.stdout), ["**/dist/**", "path with spaces"]);
+
+    const report = path.join(fixtureRoot, "spawn-report.json");
+    const launcherResult = spawnSync(
+      process.execPath,
+      [script, "--mode", "general", "--group", "general-chat"],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `--require "${writeSpawnCapturePreload(fixtureRoot).replaceAll("\\", "/")}"`,
+          PAPERCLIP_TEST_SPAWN_REPORT: report,
+          PAPERCLIP_TEST_SPAWN_STATUS: "23",
+        },
+      },
+    );
+    assert.equal(launcherResult.status, 23, launcherResult.stderr);
+
+    const invocations = JSON.parse(readFileSync(report, "utf8"));
+    assert.deepEqual(invocations.map((invocation) => invocation.args[1]), ["list", "list", "run"]);
+    for (const invocation of invocations) {
+      assert.equal(invocation.command, process.execPath);
+      assert.match(invocation.args[0], /vitest\.mjs$/);
+      assert.ok(invocation.args.includes("**/dist/**"), "the glob must remain a literal Vitest argument");
+      assert.equal(invocation.shell, null);
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
 
 
 test("the serialized shards form a complete, non-overlapping partition", () => {
