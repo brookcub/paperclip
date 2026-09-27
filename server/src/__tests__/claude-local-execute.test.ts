@@ -4,8 +4,40 @@ import os from "node:os";
 import path from "node:path";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
+import {
+  claudeCommandSupportsEffortFlag,
+  claudeSessionCwdMatchesExecutionTarget,
+  execute,
+  resetClaudeCliCapabilitiesCacheForTests,
+  sessionCodec,
+} from "@paperclipai/adapter-claude-local/server";
+
+function normalizeFixturePath(value: string): string {
+  const normalized = path.normalize(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+async function resolveFixtureSandboxCommand(command: string): Promise<string> {
+  if (process.platform !== "win32" || command !== "sh") return command;
+  for (const candidate of [
+    "C:\\Program Files\\Git\\bin\\sh.exe",
+    "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
+  ]) {
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {}
+  }
+  throw new Error("Windows sandbox fixture requires Git Bash sh.exe");
+}
+
+
 function claudeCommandPath(directory: string): string {
   return path.join(directory, process.platform === "win32" ? "claude.cmd" : "claude");
+}
+
+function posixClaudeCommandPath(commandPath: string): string {
+  return process.platform === "win32" ? commandPath.slice(0, -4) : commandPath;
 }
 
 async function writeNodeClaudeCommand(commandPath: string, script: string): Promise<void> {
@@ -15,18 +47,17 @@ async function writeNodeClaudeCommand(commandPath: string, script: string): Prom
     return;
   }
   if (!commandPath.toLowerCase().endsWith(".cmd")) throw new Error("Windows fake Claude command must use .cmd");
-  const scriptPath = `${commandPath.slice(0, -4)}.js`;
+  const posixCommandPath = posixClaudeCommandPath(commandPath);
+  const scriptPath = `${posixCommandPath}.js`;
   await fs.writeFile(scriptPath, script, "utf8");
   await fs.writeFile(commandPath, `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`, "utf8");
+  await fs.writeFile(
+    posixCommandPath,
+    `#!/usr/bin/env sh\nexec "${process.execPath.replaceAll("\\", "/")}" "${scriptPath.replaceAll("\\", "/")}" "$@"\n`,
+    "utf8",
+  );
+  await fs.chmod(posixCommandPath, 0o755);
 }
-
-import {
-  claudeCommandSupportsEffortFlag,
-  claudeSessionCwdMatchesExecutionTarget,
-  execute,
-  resetClaudeCliCapabilitiesCacheForTests,
-  sessionCodec,
-} from "@paperclipai/adapter-claude-local/server";
 
 async function writeFailingClaudeCommand(
   commandPath: string,
@@ -304,6 +335,7 @@ async function setupExecuteEnv(
   const workspace = path.join(root, "workspace");
   const binDir = path.join(root, "bin");
   const commandPath = claudeCommandPath(binDir);
+  const posixCommandPath = posixClaudeCommandPath(commandPath);
   const capturePath = path.join(root, "capture.json");
   const statePath = path.join(root, "state.txt");
   await fs.mkdir(workspace, { recursive: true });
@@ -314,7 +346,7 @@ async function setupExecuteEnv(
   process.env.HOME = root;
   process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ""}`;
   return {
-    workspace, commandPath, capturePath, statePath,
+    workspace, commandPath, posixCommandPath, capturePath, statePath,
     restore: () => {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -338,9 +370,10 @@ function createLocalSandboxRunner() {
       onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
     }) => {
       counter += 1;
+      const command = await resolveFixtureSandboxCommand(input.command);
       return runChildProcess(
         `sandbox-run-${counter}`,
-        input.command,
+        command,
         input.args ?? [],
         {
           cwd: input.cwd ?? process.cwd(),
@@ -433,7 +466,7 @@ describe("claude execute", () => {
       expect(zero.argv).not.toContain("--strict-mcp-config");
       expect(zero.mcpConfigPath).toBeNull();
       expect(zero.mcpConfigContents).toBeNull();
-      expect(alpha.mcpConfigPath).toContain("/agents/agent-alpha/");
+      expect(alpha.mcpConfigPath).toContain(path.join("agents", "agent-alpha") + path.sep);
     } finally {
       restore();
       await fs.rm(root, { recursive: true, force: true });
@@ -821,10 +854,10 @@ describe("claude execute", () => {
       expect(result.usage).toEqual({ inputTokens: 1, cachedInputTokens: 0, outputTokens: 1 });
       expect(result.usageBasis).toBe("per_run");
       expect(result.costUsd).toBeNull();
-      expect(loggedCommand).toBe(commandPath);
+      expect(normalizeFixturePath(loggedCommand ?? "")).toBe(normalizeFixturePath(commandPath));
       expect(loggedEnv.HOME).toBe(root);
       expect(loggedEnv.CLAUDE_CONFIG_DIR).toBe(claudeConfigDir);
-      expect(loggedEnv.PAPERCLIP_RESOLVED_COMMAND).toBe(commandPath);
+      expect(normalizeFixturePath(loggedEnv.PAPERCLIP_RESOLVED_COMMAND ?? "")).toBe(normalizeFixturePath(commandPath));
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -842,6 +875,7 @@ describe("claude execute", () => {
     const remoteWorkspace = path.join(root, "sandbox-$HOME");
     const binDir = path.join(root, "bin");
     const commandPath = claudeCommandPath(binDir);
+    const posixCommandPath = posixClaudeCommandPath(commandPath);
     const capturePath1 = path.join(remoteWorkspace, "capture-1.json");
     const claudeRoot = path.join(root, ".claude");
     const previousHome = process.env.HOME;
@@ -875,7 +909,7 @@ describe("claude execute", () => {
         },
         config: {
           engine: "cli",
-          command: commandPath,
+          command: posixCommandPath,
           cwd: localWorkspace,
           env: {
             PAPERCLIP_TEST_CAPTURE_PATH: capturePath1,
@@ -930,7 +964,7 @@ describe("claude execute", () => {
 
   it("omits --effort for sandbox-managed runs when the installed Claude CLI does not advertise it", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-effort-"));
-    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root, {
+    const { workspace, posixCommandPath, capturePath, restore } = await setupExecuteEnv(root, {
       commandWriter: writeHelpWithoutEffortClaudeCommand,
     });
     const remoteWorkspace = path.join(root, "sandbox-workspace");
@@ -954,7 +988,7 @@ describe("claude execute", () => {
         },
         config: {
           engine: "cli",
-          command: commandPath,
+          command: posixCommandPath,
           cwd: workspace,
           effort: "low",
           env: {
@@ -988,7 +1022,7 @@ describe("claude execute", () => {
 
   it("passes through --effort and reuses the sandbox capability probe across sandbox leases when the installed Claude CLI advertises it", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-effort-supported-"));
-    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root, {
+    const { workspace, posixCommandPath, capturePath, restore } = await setupExecuteEnv(root, {
       commandWriter: writeHelpWithEffortClaudeCommand,
     });
     const helpCountPath = path.join(root, "help-count.txt");
@@ -1011,7 +1045,7 @@ describe("claude execute", () => {
       },
       config: {
         engine: "cli",
-        command: commandPath,
+        command: posixCommandPath,
         cwd: workspace,
         effort: "low",
         env: {
