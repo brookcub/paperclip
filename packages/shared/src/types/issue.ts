@@ -12,6 +12,7 @@ import type {
   IssueExecutionDecisionOutcome,
   IssueMonitorScheduledBy,
   IssueExecutionPolicyMode,
+  PermissionKey,
   IssueReferenceSourceKind,
   IssueExecutionStageType,
   IssueExecutionStateStatus,
@@ -664,6 +665,22 @@ export interface IssueExecutionMonitorPolicy {
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
 }
 
+export type IssueRequiredCapability =
+  | { kind: "skill"; key: string; when?: { agentId: string } }
+  | {
+    kind: "tool";
+    runtime: "claude_cli" | "codex_cli" | "paperclip_mcp";
+    name: string;
+    authorization: "conditional_ok" | "must_not_prompt";
+    when?: { agentId: string };
+  }
+  | { kind: "permission"; key: PermissionKey; when?: { agentId: string } };
+
+export interface IssueRequiredCapabilities {
+  version: 1;
+  items: IssueRequiredCapability[];
+}
+
 export interface IssueExecutionPolicy {
   mode: IssueExecutionPolicyMode;
   commentRequired: boolean;
@@ -671,6 +688,7 @@ export interface IssueExecutionPolicy {
   monitor?: IssueExecutionMonitorPolicy | null;
   reviewPreset?: LowTrustReviewPresetPolicy;
   authorizationPolicy?: TrustAuthorizationPolicy;
+  requiredCapabilities?: IssueRequiredCapabilities | null;
   /**
    * Maximum consecutive agent-initiated changes-requested rounds before the
    * pending stage escalates to the responsible human. Null uses the server

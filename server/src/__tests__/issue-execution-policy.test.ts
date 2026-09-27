@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -41,6 +41,43 @@ describe("normalizeIssueExecutionPolicy", () => {
 
   it("returns null when stages are empty", () => {
     expect(normalizeIssueExecutionPolicy({ stages: [] })).toBeNull();
+    expect(normalizeIssueExecutionPolicy({ requiredCapabilities: null })).toBeNull();
+  });
+
+  it("keeps a catalog-only policy", () => {
+    expect(normalizeIssueExecutionPolicy({
+      requiredCapabilities: {
+        version: 1,
+        items: [{ kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" }],
+      },
+    })).toMatchObject({
+      stages: [],
+      requiredCapabilities: {
+        version: 1,
+        items: [{ kind: "tool", runtime: "codex_cli", name: "shell", authorization: "conditional_ok" }],
+      },
+    });
+  });
+
+  it("keeps a capability catalog alongside review stages", () => {
+    const result = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      requiredCapabilities: {
+        version: 1,
+        items: [{ kind: "skill", key: "company/test/reviewer" }],
+      },
+    });
+    expect(result?.stages).toHaveLength(1);
+    expect(result?.requiredCapabilities).toEqual({
+      version: 1,
+      items: [{ kind: "skill", key: "company/test/reviewer" }],
+    });
+  });
+
+  it("rejects an invalid capability catalog", () => {
+    expect(() => normalizeIssueExecutionPolicy({
+      requiredCapabilities: { version: 2, items: [] },
+    })).toThrow("Invalid execution policy");
   });
 
   it("throws when all participants are invalid (missing agentId)", () => {
@@ -129,6 +166,23 @@ describe("normalizeIssueExecutionPolicy", () => {
         notes: "Check deployment",
         scheduledBy: "assignee",
         externalRef: "[redacted]",
+      },
+    });
+  });
+
+  it("does not drop capabilities while removing a monitor", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z" },
+      requiredCapabilities: {
+        version: 1,
+        items: [{ kind: "permission", key: "agents:suggest-changes" }],
+      },
+    });
+    expect(stripMonitorFromExecutionPolicy(policy)).toMatchObject({
+      stages: [],
+      requiredCapabilities: {
+        version: 1,
+        items: [{ kind: "permission", key: "agents:suggest-changes" }],
       },
     });
   });
