@@ -1,6 +1,7 @@
 import { isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
+import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -180,7 +181,11 @@ function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   };
 }
 
-function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: HeartbeatRunRow): WakeQueueTransaction {
+function buildTransaction(
+  tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: HeartbeatRunRow,
+  releasedIssues: Array<{ id: string; releasedAt: string }>,
+): WakeQueueTransaction {
+  const claimedWakeIds = new Set<string>();
   const treeControlSvc = issueTreeControlService(tx);
   const issuesSvc = issueService(tx);
   const interruptQueueId = run.runtimeMode !== "native" && run.status === "cancelled"
@@ -436,6 +441,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           ),
         )
         .returning({ id: agentWakeupRequests.id });
+      if (claimed.length > 0) claimedWakeIds.add(wakeId);
       return claimed.length > 0;
     },
 
@@ -464,7 +470,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       // `deferred_issue_execution` inside this same transaction, so no
       // concurrent claimer can still match that guard; this extra `runId is
       // null` guard only protects against writing the link twice.
-      await tx
+      const [linkedWake] = await tx
         .update(agentWakeupRequests)
         .set({ runId: newRun.id, updatedAt: input.now })
         .where(
@@ -473,7 +479,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             eq(agentWakeupRequests.companyId, input.companyId),
             isNull(agentWakeupRequests.runId),
           ),
-        );
+        )
+        .returning({ promotedAt: sql<string>`clock_timestamp()::text` });
 
       // Promoted mention wakes are issue-scoped, not issue ownership
       // transfers. The lock-clearing step earlier in this transaction
@@ -496,6 +503,30 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           ),
         );
 
+      const releasedIssue = releasedIssues.find((issue) => issue.id === input.issue.id);
+      if (releasedIssue && linkedWake && claimedWakeIds.delete(input.wakeId)) {
+        // This receipts only the issue lock actually cleared in this transaction,
+        // not environment leases or later dispatch gates. Postgres now() (including
+        // event.createdAt) is transaction-start time, so retain wall-clock evidence.
+        await appendHeartbeatRunEvent(tx, {
+          companyId: input.companyId,
+          runId: newRun.id,
+          agentId: newRun.agentId,
+          eventType: "scheduler.issue_execution_promoted",
+          stream: "system",
+          level: "info",
+          message: "Deferred wake promoted after issue execution lock release",
+          payload: {
+            issueId: input.issue.id,
+            predecessorRunId: run.id,
+            wakeupRequestId: input.wakeId,
+            successorRunId: newRun.id,
+            condition: "issue_execution_lock",
+            releasedAt: new Date(releasedIssue.releasedAt).toISOString(),
+            promotedAt: new Date(linkedWake.promotedAt).toISOString(),
+          },
+        });
+      }
       return toRunSummary(newRun);
     },
 
@@ -1043,10 +1074,11 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
 
         // Two separate updates: a retry can move `executionRunId` to a new run
         // while `checkoutRunId` still points at this one finishing.
-        await tx
+        const releasedIssues = await tx
           .update(issues)
           .set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null, updatedAt: input.now })
-          .where(and(eq(issues.companyId, input.companyId), eq(issues.executionRunId, run.id)));
+          .where(and(eq(issues.companyId, input.companyId), eq(issues.executionRunId, run.id)))
+          .returning({ id: issues.id, releasedAt: sql<string>`clock_timestamp()::text` });
         await tx
           .update(issues)
           .set({ checkoutRunId: null, updatedAt: input.now })
@@ -1167,7 +1199,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         }
 
         const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
-        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
+        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run, releasedIssues) });
         return { ...result, run: runSnapshot };
       });
     },

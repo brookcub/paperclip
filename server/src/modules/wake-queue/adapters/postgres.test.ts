@@ -9,6 +9,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueComments,
   issueRecoveryActions,
   issues,
@@ -59,6 +60,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await db.delete(issueComments);
     // `heartbeat_runs.wakeup_request_id` references `agent_wakeup_requests.id`,
     // so the run row must go first.
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRecoveryActions);
@@ -527,6 +529,71 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(issueRow?.executionState).toBeNull();
   });
 
+  it.each(["released", "already_clear", "new_owner", "rollback"])(
+    "receipts only a committed issue-lock release and correlated promotion (%s)", async (scenario) => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const reviewerId = await seedAgent({ companyId, name: "Reviewer" });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "succeeded" });
+      const ownerId = scenario === "new_owner"
+        ? await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "running" })
+        : scenario === "already_clear" ? null : runId;
+      await db.update(issues).set({ executionRunId: ownerId }).where(eq(issues.id, issueId));
+      const wakeId = await seedDeferredWake({ companyId, agentId: reviewerId, issueId, payload: {
+        _paperclipWakeContext: { issueId, contextSource: "issue.execution_stage", selfHandoffSourceRunId: runId,
+          wakeReason: "issue_execution_stage" },
+      } });
+      const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+      const release = createReleaseIssueExecution({
+        issueLock: scenario === "rollback" ? {
+          withIssueExecutionLock: (input, fn) => adapter.withIssueExecutionLock(input, async (locked, ports) => {
+            const result = await fn(locked, ports);
+            expect(result.outcome.kind).toBe("promoted");
+            throw new Error("rollback after promotion receipt");
+          }),
+        } : adapter,
+        recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} },
+      });
+      // An old caller clock must never become the observed transition time.
+      const before = Date.now();
+      const operation = release({ companyId, runId, now: new Date("2000-01-01T00:00:00Z") });
+      if (scenario === "rollback") await expect(operation).rejects.toThrow("rollback after promotion receipt");
+      else expect((await operation).outcome.kind).toBe(scenario === "new_owner" ? "released" : "promoted");
+      const after = Date.now();
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId));
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      if (scenario === "released") {
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ runId: wake.runId, agentId: reviewerId,
+          eventType: "scheduler.issue_execution_promoted", stream: "system", sourceEventId: null,
+          payload: { issueId, predecessorRunId: runId, wakeupRequestId: wakeId, successorRunId: wake.runId,
+            condition: "issue_execution_lock" },
+        });
+        const payload = events[0]!.payload!;
+        const releasedAt = Date.parse(payload.releasedAt as string);
+        const promotedAt = Date.parse(payload.promotedAt as string);
+        expect(releasedAt).toBeGreaterThanOrEqual(before);
+        expect(promotedAt).toBeGreaterThanOrEqual(releasedAt);
+        expect(promotedAt).toBeLessThanOrEqual(after);
+        const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId!));
+        expect(successor).toMatchObject({ companyId, agentId: reviewerId, wakeupRequestId: wakeId,
+          status: "queued", contextSnapshot: { issueId, selfHandoffSourceRunId: runId } });
+        // A repeated cleanup cannot manufacture a second release or receipt.
+        await release({ companyId, runId, now: new Date() });
+        expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId))).toHaveLength(1);
+      } else {
+        expect(events).toEqual([]);
+        if (scenario === "already_clear") expect(wake.runId).not.toBeNull();
+        else {
+          expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+          expect(issue.executionRunId).toBe(ownerId);
+        }
+      }
+    },
+  );
+
   // Review test (c): a deferred-status compare-and-set that affects no row
   // claims nothing, and no other write in the promotion path ever runs.
   it("fails the promotion claim when the deferred-status compare-and-set loses the race, before any other write", async () => {
@@ -539,6 +606,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
 
     const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
     const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "succeeded" });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const result = await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
       const claimed = await ports.transaction.claimDeferredWakeForPromotion({ companyId, wakeId, now: new Date() });
       expect(claimed).toBe(false);
@@ -553,6 +621,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(issueRow?.executionRunId).toBeNull();
     const wakeRow = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0];
     expect(wakeRow?.status).toBe("cancelled");
+    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId))).toEqual([]);
   });
 
   // `finalizePromotedWake`'s own writes guard against clobbering state a
@@ -569,6 +638,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const wakeIdA = await seedDeferredWake({ companyId, agentId, issueId });
     const wakeIdB = await seedDeferredWake({ companyId, agentId, issueId });
     const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "succeeded" });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const deferredAgent = { id: agentId, companyId, name: "CodexCoder", invokable: true };
 
     const finalizedRunIds: string[] = [];
@@ -615,6 +685,9 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
     // All three finalize calls each still insert their own run row.
     expect(runs.map((run) => run.id).sort()).toEqual([runId, runA, runB, runC].sort());
+    // Direct finalization never claimed a deferred wake, so it is not a
+    // receipted promotion even though the transaction really cleared a lock.
+    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, companyId))).toEqual([]);
   });
 
   it("locks the context issue and every sibling issue in id order, and two concurrent releases do not deadlock", async () => {
