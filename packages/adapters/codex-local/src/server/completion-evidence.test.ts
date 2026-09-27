@@ -87,13 +87,31 @@ describe("captureCodexRolloutCompletionEvidence", () => {
     ]));
   });
 
-  it("refuses a rollout symlink even when its target has a matching session", async () => {
+  // Windows permits directory junctions without enabling the file-symlink privilege.
+  // Keep both platform-specific controls visible in test output instead of silently
+  // treating a failed link setup as a containment pass.
+  it.skipIf(process.platform === "win32")("refuses a rollout file symlink even when its target has a matching session", async () => {
     const { root, sessionId, rollout } = await fixture();
     const outside = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-evidence-outside-"));
     roots.push(outside);
     const target = path.join(outside, path.basename(rollout));
     await writeFile(target, metadata(sessionId));
     await symlink(target, rollout, "file");
+    await expect(captureCodexRolloutCompletionEvidence({ codexHome: root, sessionId }))
+      .resolves.toMatchObject({ status: "unavailable", parseGaps: ["codex_rollout_unavailable"] });
+  });
+
+  it.skipIf(process.platform !== "win32")("refuses a rollout reached through an outside directory junction", async () => {
+    const { root, sessionId, rollout } = await fixture();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-evidence-outside-"));
+    roots.push(outside);
+    const target = path.join(outside, "09", "27", path.basename(rollout));
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, metadata(sessionId));
+    const linkedYear = path.join(root, "sessions", "2026");
+    await rm(linkedYear, { recursive: true, force: true });
+    await symlink(outside, linkedYear, "junction");
+
     await expect(captureCodexRolloutCompletionEvidence({ codexHome: root, sessionId }))
       .resolves.toMatchObject({ status: "unavailable", parseGaps: ["codex_rollout_unavailable"] });
   });
