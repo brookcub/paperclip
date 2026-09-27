@@ -11,13 +11,15 @@ import {
   companySkills,
   createDb,
   environments,
+  agentWakeupRequests,
   heartbeatRuns,
   issueComments,
   issues,
   principalPermissionGrants,
 } from "@paperclipai/db";
 import { companySkillService } from "../services/company-skills.js";
-import { heartbeatService } from "../services/heartbeat.js";
+import { getTaskDrainStatus, heartbeatService } from "../services/heartbeat.js";
+import { withAgentStartLock } from "../services/agent-start-lock.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { PAPERCLIP_OPERATIONAL_SKILL_KEY } from "@paperclipai/adapter-utils/server-utils";
 
@@ -228,6 +230,84 @@ describeEmbedded("heartbeat required capability admission", () => {
     const [run] = runs;
     expect(run).toMatchObject({ status: "cancelled", startedAt: null, errorCode: "required_capabilities_unavailable" });
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("tracks a deferred wake promoted by lock-owned capability cancellation", async () => {
+    const { companyId, agentId, issueId } = await seed({ requiredCapabilities: { version: 1, items: [
+      { kind: "tool", runtime: "claude_cli", name: "Bash", authorization: "conditional_ok" },
+    ] } });
+    let releaseClaim!: () => void;
+    const claimPaused = new Promise<void>((resolve) => { releaseClaim = resolve; });
+    let claimEntered!: () => void;
+    const claimReached = new Promise<void>((resolve) => { claimEntered = resolve; });
+    let releaseStartLock!: () => void;
+    const startLockPaused = new Promise<void>((resolve) => { releaseStartLock = resolve; });
+    let heldStartLock: Promise<void> | null = null;
+    let hookUsed = false;
+    const heartbeat = heartbeatService(db, {
+      beforeChatControlRecoveryCheck: async ({ stage }) => {
+        if (stage !== "claim" || hookUsed) return;
+        hookUsed = true;
+        heldStartLock = withAgentStartLock(agentId, async () => {
+          await startLockPaused;
+        });
+        claimEntered();
+        await claimPaused;
+      },
+    });
+
+    try {
+      const outerWake = wakeQueuedAutomation(heartbeat, companyId, agentId, issueId);
+      await claimReached;
+      const [comment] = await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        authorUserId: "capability-test-user",
+        body: "Deferred capability follow-up.",
+      }).returning();
+      await db.insert(agentWakeupRequests).values({
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_execution_deferred",
+        status: "deferred_issue_execution",
+        requestedByActorType: "user",
+        requestedByActorId: "capability-test-user",
+        payload: {
+          issueId,
+          commentId: comment!.id,
+          _paperclipWakeContext: {
+            issueId,
+            wakeReason: "issue_commented",
+            wakeCommentId: comment!.id,
+            wakeCommentIds: [comment!.id],
+          },
+        },
+      });
+      releaseClaim();
+      await outerWake;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(getTaskDrainStatus()).toMatchObject({
+        activeRuns: 0,
+        pendingWakes: 1,
+        quiescent: false,
+      });
+
+      releaseStartLock();
+      await heldStartLock;
+      await heartbeat.drainActiveRunExecutions();
+      expect(getTaskDrainStatus()).toMatchObject({
+        activeRuns: 0,
+        pendingWakes: 0,
+        quiescent: true,
+      });
+      expect(execute).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseClaim();
+      releaseStartLock();
+      await heldStartLock;
+      await heartbeat.drainActiveRunExecutions();
+    }
   });
 
   it("preserves legacy execution when no catalog is declared", async () => {
