@@ -26008,6 +26008,7 @@ export function heartbeatService(
               return null;
             });
           const completionEvidence = buildRunCompletionEvidence({
+            runId: terminalRun.id,
             adapterType: completionEvidenceAdapterType,
             adapterResultJson: terminalRun.resultJson,
             providerTrace,
