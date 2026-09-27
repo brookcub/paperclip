@@ -341,30 +341,42 @@ function transcriptTrace(
   const sourceKeys = new Set(sourceFiles.map((file) => `${file.role}:${file.fileName}:${file.sha256}`));
   const records: ClaudeTranscriptTrace["records"] = trace.records.flatMap((value) => {
     const item = record(value);
-    const recordTimestamp = item ? offsetTimestamp(item.timestamp) : null;
+    if (!item) return [];
+    const fileName = item.fileName;
+    const fileSha256 = item.fileSha256;
+    const role = item.role;
+    const line = item.line;
+    const recordType = item.recordType;
+    const recordTimestamp = offsetTimestamp(item.timestamp);
+    const model = item.model;
+    const effort = item.effort;
+    const toolSchemaHashes = item.toolSchemaHashes;
+    const safeToolSchemaHashes = Array.isArray(toolSchemaHashes)
+      ? toolSchemaHashes.filter((hash): hash is string => typeof hash === "string" && SHA256_RE.test(hash))
+      : [];
     if (
-      !item || !FILE_RE.test(String(item.fileName ?? "")) ||
-      !SHA256_RE.test(String(item.fileSha256 ?? "")) ||
-      (item.role !== "parent" && item.role !== "child") ||
-      !Number.isSafeInteger(item.line) || item.line < 1 ||
-      (item.recordType !== null && !VALUE_RE.test(String(item.recordType))) ||
+      typeof fileName !== "string" || !FILE_RE.test(fileName) ||
+      typeof fileSha256 !== "string" || !SHA256_RE.test(fileSha256) ||
+      (role !== "parent" && role !== "child") ||
+      typeof line !== "number" || !Number.isSafeInteger(line) || line < 1 ||
+      (recordType !== null && (typeof recordType !== "string" || !VALUE_RE.test(recordType))) ||
       recordTimestamp === null || Date.parse(recordTimestamp) < attemptStartedAt ||
-      !sourceKeys.has(`${item.role}:${item.fileName}:${String(item.fileSha256).toLowerCase()}`) ||
-      (item.model !== null && !VALUE_RE.test(String(item.model))) ||
-      (item.effort !== null && !VALUE_RE.test(String(item.effort))) ||
-      !Array.isArray(item.toolSchemaHashes) || item.toolSchemaHashes.length > MAX_TRACE_SCHEMA_HASHES ||
-      item.toolSchemaHashes.some((hash) => typeof hash !== "string" || !SHA256_RE.test(hash))
+      !sourceKeys.has(`${role}:${fileName}:${fileSha256.toLowerCase()}`) ||
+      (model !== null && (typeof model !== "string" || !VALUE_RE.test(model))) ||
+      (effort !== null && (typeof effort !== "string" || !VALUE_RE.test(effort))) ||
+      !Array.isArray(toolSchemaHashes) || toolSchemaHashes.length > MAX_TRACE_SCHEMA_HASHES ||
+      safeToolSchemaHashes.length !== toolSchemaHashes.length
     ) return [];
     return [{
-      fileName: item.fileName as string,
-      fileSha256: (item.fileSha256 as string).toLowerCase(),
-      role: item.role as "parent" | "child",
-      line: item.line as number,
-      recordType: item.recordType === null ? null : item.recordType as string,
+      fileName,
+      fileSha256: fileSha256.toLowerCase(),
+      role,
+      line,
+      recordType,
       timestamp: recordTimestamp,
-      model: item.model === null ? null : item.model as string,
-      effort: item.effort === null ? null : item.effort as string,
-      toolSchemaHashes: (item.toolSchemaHashes as string[]).map((hash) => hash.toLowerCase()),
+      model,
+      effort,
+      toolSchemaHashes: safeToolSchemaHashes.map((hash) => hash.toLowerCase()),
     }];
   });
   if (records.length !== trace.records.length || (trace.status === "partial" && records.length === 0)) return null;
@@ -398,34 +410,41 @@ function transcriptTrace(
 
 function transcriptEvidence(value: unknown, runId: string | undefined): DurableClaudeTranscriptEvidence | null {
   const evidence = record(value);
+  const attempt = record(evidence?.attempt);
+  const status = evidence?.status;
+  const sessionId = evidence?.sessionId;
+  const attemptStartedAt = offsetTimestamp(attempt?.startedAt);
+  const resumed = attempt?.resumed;
   if (
     !evidence ||
     evidence.schema !== "paperclip.claude-transcript-completion-evidence.v1" ||
     evidence.source !== "claude_config_transcript" ||
     evidence.toolSchemaProjection !== "prompt_snapshot_safe_structure.v1" ||
-    !["available", "partial", "unavailable"].includes(String(evidence.status)) ||
+    (status !== "available" && status !== "partial" && status !== "unavailable") ||
     !Array.isArray(evidence.files) ||
     evidence.files.length > MAX_FILES ||
-    !record(evidence.attempt) ||
-    (evidence.attempt.resumed !== true && evidence.attempt.resumed !== false) ||
-    offsetTimestamp(evidence.attempt.startedAt) === null ||
+    !attempt ||
+    (resumed !== true && resumed !== false) ||
+    attemptStartedAt === null ||
     !Array.isArray(evidence.parseGaps) ||
-    !ID_RE.test(String(evidence.sessionId ?? "")) && evidence.sessionId !== null
+    (sessionId !== null && (typeof sessionId !== "string" || !ID_RE.test(sessionId)))
   ) {
     return null;
   }
-  const files = evidence.files
-    .slice(0, MAX_DURABLE_FILES)
-    .map(transcriptFile);
-  if (files.some((file) => file === null)) return null;
-  const durableFiles = files as DurableTranscriptFile[];
+  const durableFiles: DurableTranscriptFile[] = [];
+  for (const file of evidence.files.slice(0, MAX_DURABLE_FILES)) {
+    const durableFile = transcriptFile(file);
+    if (!durableFile) return null;
+    durableFiles.push(durableFile);
+  }
   const durableTrace = transcriptTrace(
     evidence.transcriptTrace,
     runId,
-    Date.parse(evidence.attempt.startedAt as string),
+    Date.parse(attemptStartedAt),
     durableFiles,
   );
   if (!durableTrace) return null;
+  const durableSessionId = typeof sessionId === "string" ? sessionId : null;
   const parseGaps = [
     ...evidence.parseGaps
       .filter((gap): gap is string => typeof gap === "string" && VALUE_RE.test(gap))
@@ -439,13 +458,13 @@ function transcriptEvidence(value: unknown, runId: string | undefined): DurableC
   ].slice(0, MAX_PARSE_GAPS);
   return {
     schema: "paperclip.claude-transcript-completion-evidence.v1",
-    status: evidence.status === "available" && parseGaps.length > 0
+    status: status === "available" && parseGaps.length > 0
       ? "partial"
-      : evidence.status as DurableClaudeTranscriptEvidence["status"],
+      : status,
     source: "claude_config_transcript",
-    sessionId: typeof evidence.sessionId === "string" ? evidence.sessionId : null,
+    sessionId: durableSessionId,
     toolSchemaProjection: "prompt_snapshot_safe_structure.v1",
-    attempt: { startedAt: evidence.attempt.startedAt as string, resumed: evidence.attempt.resumed as boolean },
+    attempt: { startedAt: attemptStartedAt, resumed },
     transcriptTrace: durableTrace,
     files: durableFiles,
     parseGaps,
