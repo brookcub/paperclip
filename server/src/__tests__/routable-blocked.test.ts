@@ -51,6 +51,35 @@ describe("routable blocked notifications", () => {
     expect(markNotified).not.toHaveBeenCalled();
   });
 
+  it("does not wake an assignee who named itself as the unblock owner", async () => {
+    const wakeup = vi.fn(async () => undefined);
+    const markNotified = vi.fn(async () => undefined);
+
+    await expect(deliverAgentUnblockNotification({
+      issue: { ...blockedIssue(), assigneeAgentId: agentId },
+      actorAgentId: agentId,
+      wakeup,
+      markNotified,
+    })).resolves.toBe(false);
+
+    expect(wakeup).not.toHaveBeenCalled();
+    expect(markNotified).not.toHaveBeenCalled();
+  });
+
+  it("still wakes a self-owned descriptor after a board transition", async () => {
+    const wakeup = vi.fn(async () => undefined);
+    const markNotified = vi.fn(async () => undefined);
+
+    await expect(deliverAgentUnblockNotification({
+      issue: { ...blockedIssue(), assigneeAgentId: agentId },
+      wakeup,
+      markNotified,
+    })).resolves.toBe(true);
+
+    expect(wakeup).toHaveBeenCalledWith(agentId, expect.anything());
+    expect(markNotified).toHaveBeenCalledTimes(1);
+  });
+
   it("deduplicates one transition and notifies again after a blocked flap", async () => {
     const wakeup = vi.fn(async () => undefined);
     const markNotified = vi.fn(async () => undefined);

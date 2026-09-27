@@ -13769,6 +13769,7 @@ export function issueRoutes(
         await deliverAgentUnblockNotification({
           issue: blockedIssue,
           wakeup: heartbeat.wakeup,
+          actorAgentId: actor.agentId,
           markNotified: async (blockedOwnerNotifiedAt) => {
             ownerNotifiedAt = blockedOwnerNotifiedAt;
           },
@@ -14773,9 +14774,24 @@ export function issueRoutes(
           }
         }
 
+        const unchangedAssigneeBlockedDependencyWrite =
+          actor.actorType === "agent" &&
+          actor.agentId === issue.assigneeAgentId &&
+          existing.status === "blocked" &&
+          existing.assigneeAgentId === issue.assigneeAgentId &&
+          Array.isArray(req.body.blockedByIssueIds) &&
+          (() => {
+            const previous = new Set(
+              (existingRelations?.blockedBy ?? []).map((relation) => relation.id),
+            );
+            const requested = new Set(req.body.blockedByIssueIds as string[]);
+            return previous.size === requested.size &&
+              [...previous].every((blockerId) => requested.has(blockerId));
+          })();
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
           issue.assigneeAgentId &&
+          !unchangedAssigneeBlockedDependencyWrite &&
           (existing.status !== "blocked" ||
             Array.isArray(req.body.blockedByIssueIds) ||
             existing.assigneeAgentId !== issue.assigneeAgentId);

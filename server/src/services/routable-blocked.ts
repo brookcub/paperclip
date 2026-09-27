@@ -5,6 +5,7 @@ export const ROUTABLE_BLOCKED_ROLLOUT_AT = new Date("2026-07-23T18:13:03.000Z");
 type RoutableBlockedIssue = {
   id: string;
   status: string;
+  assigneeAgentId?: string | null;
   unblockDescriptor?: IssueUnblockDescriptor | null;
   blockedTransitionAt?: Date | null;
   blockedOwnerNotifiedAt?: Date | null;
@@ -31,6 +32,7 @@ export async function deliverAgentUnblockNotification(input: {
     contextSnapshot: { wakeReason: "issue_unblock_requested"; issueId: string; taskId: string };
   }) => Promise<unknown>;
   markNotified: (notifiedAt: Date) => Promise<unknown>;
+  actorAgentId?: string | null;
   now?: () => Date;
 }) {
   const { issue } = input;
@@ -40,6 +42,9 @@ export async function deliverAgentUnblockNotification(input: {
 
   const owner = issue.unblockDescriptor.owner;
   if (owner === "board" || !("agentId" in owner)) return false;
+  if (owner.agentId === issue.assigneeAgentId && owner.agentId === input.actorAgentId) {
+    return false;
+  }
 
   await input.wakeup(owner.agentId, {
     source: "automation",
