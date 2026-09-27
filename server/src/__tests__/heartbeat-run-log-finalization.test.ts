@@ -32,6 +32,7 @@ import { heartbeatService } from "../services/heartbeat.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const TEST_ADAPTER_TYPE = "run_log_append_rejection";
+const PROVIDER_PROGRESS_MARKER = "provider progress\n";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -59,6 +60,7 @@ describeEmbeddedPostgres("heartbeat run-log finalization", () => {
   let oldPaperclipHome: string | undefined;
   let oldPaperclipApiUrl: string | undefined;
   let paperclipHome: string | null = null;
+  let fakeAdapterExecutionCount = 0;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-run-log-finalization-");
@@ -71,10 +73,11 @@ describeEmbeddedPostgres("heartbeat run-log finalization", () => {
     registerServerAdapter({
       type: TEST_ADAPTER_TYPE,
       execute: async (ctx) => {
+        fakeAdapterExecutionCount += 1;
         // Remote progress callbacks may intentionally not await the promise.
         // Retain the rejection locally so the test itself does not emit an
         // unhandled rejection; heartbeat must still surface it at finalization.
-        void ctx.onLog("stdout", "provider progress\n").catch(() => undefined);
+        void ctx.onLog("stdout", PROVIDER_PROGRESS_MARKER).catch(() => undefined);
         return { exitCode: 0, signal: null, timedOut: false };
       },
       testEnvironment: async () => ({
@@ -87,6 +90,7 @@ describeEmbeddedPostgres("heartbeat run-log finalization", () => {
   }, 60_000);
 
   afterEach(async () => {
+    fakeAdapterExecutionCount = 0;
     mockedRunLogStore.append.mockReset();
     mockedRunLogStore.begin.mockReset();
     mockedRunLogStore.finalize.mockReset();
@@ -120,7 +124,15 @@ describeEmbeddedPostgres("heartbeat run-log finalization", () => {
 
   it("fails a successful adapter result when a fire-and-forget log append rejects", async () => {
     mockedRunLogStore.begin.mockResolvedValue({ store: "local_file", logRef: "rejected.ndjson" });
-    mockedRunLogStore.append.mockRejectedValue(new Error("synthetic run-log append failure"));
+    mockedRunLogStore.append.mockImplementation(async (
+      _handle: Parameters<RunLogStore["append"]>[0],
+      event: Parameters<RunLogStore["append"]>[1],
+    ) => {
+      if (event.stream === "stdout" && event.chunk === PROVIDER_PROGRESS_MARKER) {
+        throw new Error("synthetic run-log append failure");
+      }
+      return 1;
+    });
     mockedRunLogStore.finalize.mockResolvedValue({ bytes: 0, compressed: false });
 
     const companyId = randomUUID();
@@ -151,7 +163,11 @@ describeEmbeddedPostgres("heartbeat run-log finalization", () => {
     await heartbeat.waitForRunExecutionDrain(run!.id);
 
     expect(terminal).toMatchObject({ status: "failed" });
-    expect(mockedRunLogStore.append).toHaveBeenCalledTimes(1);
+    expect(fakeAdapterExecutionCount).toBe(1);
+    expect(mockedRunLogStore.append).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ stream: "stdout", chunk: PROVIDER_PROGRESS_MARKER }),
+    );
     expect(mockedRunLogStore.finalize).not.toHaveBeenCalled();
   });
 });
