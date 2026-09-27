@@ -24,10 +24,26 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { PAPERCLIP_OPERATIONAL_SKILL_KEY } from "@paperclipai/adapter-utils/server-utils";
 
 const execute = vi.hoisted(() => vi.fn(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "capability test", provider: "test", model: "test" })));
+const agentStartLockProbe = vi.hoisted(() => ({
+  onQueued: null as ((agentId: string) => void) | null,
+}));
 vi.mock("../adapters/index.js", async () => ({
   ...(await vi.importActual<typeof import("../adapters/index.js")>("../adapters/index.js")),
   getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute })),
 }));
+vi.mock("../services/agent-start-lock.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/agent-start-lock.js")>(
+    "../services/agent-start-lock.js",
+  );
+  return {
+    ...actual,
+    withAgentStartLock: <T>(agentId: string, fn: () => Promise<T>) => {
+      const promise = actual.withAgentStartLock(agentId, fn);
+      agentStartLockProbe.onQueued?.(agentId);
+      return promise;
+    },
+  };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeEmbedded = support.supported ? describe : describe.skip;
@@ -58,6 +74,7 @@ describeEmbedded("heartbeat required capability admission", () => {
     await temp?.cleanup();
   });
   afterEach(async () => {
+    agentStartLockProbe.onQueued = null;
     await heartbeatService(db).drainActiveRunExecutions();
     execute.mockReset();
     execute.mockImplementation(async () => ({ exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "capability test", provider: "test", model: "test" }));
@@ -236,14 +253,63 @@ describeEmbedded("heartbeat required capability admission", () => {
     const { companyId, agentId, issueId } = await seed({ requiredCapabilities: { version: 1, items: [
       { kind: "tool", runtime: "claude_cli", name: "Bash", authorization: "conditional_ok" },
     ] } });
-    let releaseClaim!: () => void;
-    const claimPaused = new Promise<void>((resolve) => { releaseClaim = resolve; });
-    let claimEntered!: () => void;
-    const claimReached = new Promise<void>((resolve) => { claimEntered = resolve; });
-    let releaseStartLock!: () => void;
-    const startLockPaused = new Promise<void>((resolve) => { releaseStartLock = resolve; });
-    let heldStartLock: Promise<void> | null = null;
-    let hookUsed = false;
+    const [comment] = await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorUserId: "capability-test-user",
+      body: "Deferred capability follow-up.",
+    }).returning();
+    const [primaryWake] = await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "capability-test",
+      reason: "issue_commented",
+      status: "queued",
+      requestedByActorType: "user",
+      requestedByActorId: "capability-test-user",
+      payload: { issueId, commentId: comment!.id },
+    }).returning();
+    const [primaryRun] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "capability-test",
+      status: "queued",
+      responsibleUserId: "responsible-user",
+      wakeupRequestId: primaryWake!.id,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_commented",
+        wakeCommentIds: [comment!.id],
+      },
+    }).returning();
+    await db.update(issues).set({
+      executionRunId: primaryRun!.id,
+      executionAgentNameKey: "runner",
+      executionLockedAt: new Date(),
+    }).where(eq(issues.id, issueId));
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      triggerDetail: "capability-test",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      requestedByActorType: "user",
+      requestedByActorId: "capability-test-user",
+      payload: {
+        issueId,
+        commentId: comment!.id,
+        _paperclipWakeContext: {
+          issueId,
+          wakeReason: "issue_commented",
+          wakeCommentId: comment!.id,
+          wakeCommentIds: [comment!.id],
+        },
+      },
+    });
     async function awaitStage<T>(stage: string, promise: Promise<T>): Promise<T> {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -259,49 +325,33 @@ describeEmbedded("heartbeat required capability admission", () => {
         if (timer) clearTimeout(timer);
       }
     }
-    const heartbeat = heartbeatService(db, {
-      beforeChatControlRecoveryCheck: async ({ stage }) => {
-        if (stage !== "claim" || hookUsed) return;
-        hookUsed = true;
-        heldStartLock = withAgentStartLock(agentId, async () => {
-          await startLockPaused;
-        });
-        claimEntered();
-        await claimPaused;
-      },
+    let releaseFirstLock = () => {};
+    let firstLockEntered!: () => void;
+    const firstLockEnteredPromise = new Promise<void>((resolve) => { firstLockEntered = resolve; });
+    let releaseSecondLock = () => {};
+    let secondLock: Promise<void> | null = null;
+    let resumer: Promise<void> | null = null;
+    const heartbeat = heartbeatService(db);
+    const firstLock = withAgentStartLock(agentId, async () => {
+      firstLockEntered();
+      await new Promise<void>((resolve) => { releaseFirstLock = resolve; });
     });
 
     try {
-      const outerWake = wakeQueuedAutomation(heartbeat, companyId, agentId, issueId);
-      await awaitStage("claim hook", claimReached);
-      const [comment] = await db.insert(issueComments).values({
-        companyId,
-        issueId,
-        authorUserId: "capability-test-user",
-        body: "Deferred capability follow-up.",
-      }).returning();
-      await db.insert(agentWakeupRequests).values({
-        companyId,
-        agentId,
-        source: "automation",
-        reason: "issue_execution_deferred",
-        status: "deferred_issue_execution",
-        requestedByActorType: "user",
-        requestedByActorId: "capability-test-user",
-        payload: {
-          issueId,
-          commentId: comment!.id,
-          _paperclipWakeContext: {
-            issueId,
-            wakeReason: "issue_commented",
-            wakeCommentId: comment!.id,
-            wakeCommentIds: [comment!.id],
-          },
-        },
+      await awaitStage("first queue lock", firstLockEnteredPromise);
+      let resumeLockQueued!: () => void;
+      const resumeLockQueuedPromise = new Promise<void>((resolve) => { resumeLockQueued = resolve; });
+      agentStartLockProbe.onQueued = (lockedAgentId) => {
+        if (lockedAgentId === agentId) resumeLockQueued();
+      };
+      resumer = heartbeat.resumeQueuedRuns();
+      await awaitStage("resume queue lock", resumeLockQueuedPromise);
+      agentStartLockProbe.onQueued = null;
+      secondLock = withAgentStartLock(agentId, async () => {
+        await new Promise<void>((resolve) => { releaseSecondLock = resolve; });
       });
-      releaseClaim();
-      await awaitStage("outer wake", outerWake);
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      releaseFirstLock();
+      await awaitStage("resume queued runs", resumer);
       expect(getTaskDrainStatus()).toMatchObject({
         activeRuns: 0,
         pendingWakes: 1,
@@ -310,27 +360,34 @@ describeEmbedded("heartbeat required capability admission", () => {
       const [cancelled] = await db
         .select()
         .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.companyId, companyId));
+        .where(eq(heartbeatRuns.id, primaryRun!.id));
       expect(cancelled).toMatchObject({
         status: "cancelled",
         startedAt: null,
         errorCode: "required_capabilities_unavailable",
       });
-      await db.update(issues).set({ executionPolicy: {} }).where(eq(issues.id, issueId));
 
-      releaseStartLock();
-      await awaitStage("queued lock", heldStartLock!);
+      releaseSecondLock();
+      await awaitStage("second queue lock", secondLock);
       await awaitStage("lifecycle drain", heartbeat.drainActiveRunExecutions());
       expect(getTaskDrainStatus()).toMatchObject({
         activeRuns: 0,
         pendingWakes: 0,
         quiescent: true,
       });
-      expect(execute).toHaveBeenCalledTimes(1);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(runs).toHaveLength(2);
+      expect(runs.every((run) =>
+        run.status === "cancelled" &&
+        run.startedAt === null &&
+        run.errorCode === "required_capabilities_unavailable",
+      )).toBe(true);
+      expect(execute).not.toHaveBeenCalled();
     } finally {
-      releaseClaim();
-      releaseStartLock();
-      await heldStartLock;
+      agentStartLockProbe.onQueued = null;
+      releaseFirstLock();
+      releaseSecondLock();
+      await Promise.allSettled([firstLock, ...(secondLock ? [secondLock] : []), ...(resumer ? [resumer] : [])]);
       await heartbeat.drainActiveRunExecutions();
     }
   });
