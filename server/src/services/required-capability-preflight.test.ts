@@ -94,7 +94,7 @@ describe("required capability preflight", () => {
     const snapshot = {
       issueId: "issue-1", agentId: "agent-1", issueUpdatedAt: "2026-09-27T00:00:00.000Z", executionPolicy: stableCapabilitySnapshot({ requiredCapabilities: { version: 1 } }),
       agentUpdatedAt: "2026-09-27T00:00:00.000Z", adapterType: "claude_local", adapterConfig: stableCapabilitySnapshot({ dangerouslySkipPermissions: false }),
-      permissionKeys: ["agents:suggest-changes"], allowedAgentPermissionKeys: ["agents:suggest-changes"], managedMcpRevision: "mcp-1", skillRevisions: [],
+      permissionKeys: ["agents:suggest-changes"], allowedAgentPermissionKeys: ["agents:suggest-changes"], managedMcpRevision: "mcp-1", skillRevisions: [], skillVersionPinsEnabled: false,
     };
     expect(capabilityPreflightSnapshotIsCurrent(snapshot, { ...snapshot })).toBe(true);
     expect(capabilityPreflightSnapshotIsCurrent(snapshot, { ...snapshot, allowedAgentPermissionKeys: [] })).toBe(false);
