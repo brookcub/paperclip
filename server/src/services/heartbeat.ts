@@ -9644,7 +9644,10 @@ export function heartbeatService(
   // the original release function did before its writes moved into that
   // module: publish + dispatch a promoted or recovery run, log a reopened
   // issue's activity entry.
-  async function applyWakeQueuePostCommitEffects(effects: WakeQueuePostCommitEffect[]) {
+  async function applyWakeQueuePostCommitEffects(
+    effects: WakeQueuePostCommitEffect[],
+    options: { deferRunStart?: boolean } = {},
+  ) {
     for (const effect of effects) {
       if (effect.kind === "conversation_retry_requested") {
         const [source] = await db.select().from(heartbeatRuns).where(and(
@@ -9669,7 +9672,16 @@ export function heartbeatService(
             wakeupRequestId: effect.run.wakeupRequestId,
           },
         });
-        await startNextQueuedRunForAgent(effect.run.agentId);
+        if (options.deferRunStart) {
+          void startNextQueuedRunForAgent(effect.run.agentId).catch((err) => {
+            logger.error(
+              { err, runId: effect.run.id },
+              "deferred queued-run start failed",
+            );
+          });
+        } else {
+          await startNextQueuedRunForAgent(effect.run.agentId);
+        }
       } else {
         await logActivity(db, {
           companyId: effect.companyId,
@@ -26149,7 +26161,10 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: {
+      suppressImmediateRecovery?: boolean;
+      deferRunStart?: boolean;
+    } = {},
   ) {
     try {
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
@@ -26158,7 +26173,7 @@ export function heartbeatService(
         now: new Date(),
         suppressImmediateRecovery: options.suppressImmediateRecovery,
       });
-      await applyWakeQueuePostCommitEffects(postCommitEffects);
+      await applyWakeQueuePostCommitEffects(postCommitEffects, options);
     } catch (error) {
       if (
         error instanceof WakeQueueApplicationError &&
@@ -29136,7 +29151,9 @@ export function heartbeatService(
           ...(options.eventPayload ? { payload: options.eventPayload } : {}),
         });
         await releaseIssueExecutionAndPromote(cancelled, {
-          suppressImmediateRecovery: options.suppressImmediateRecovery,
+          suppressImmediateRecovery:
+            options.suppressImmediateRecovery || options.suppressNextQueuedRunStart,
+          deferRunStart: options.suppressNextQueuedRunStart,
         });
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),

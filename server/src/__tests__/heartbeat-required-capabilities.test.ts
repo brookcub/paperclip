@@ -222,7 +222,9 @@ describeEmbedded("heartbeat required capability admission", () => {
     ] } });
     const heartbeat = heartbeatService(db);
     await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "capability-test", contextSnapshot: { issueId } });
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(1);
+    const [run] = runs;
     expect(run).toMatchObject({ status: "cancelled", startedAt: null, errorCode: "required_capabilities_unavailable" });
     expect(execute).not.toHaveBeenCalled();
   });
