@@ -96,6 +96,25 @@ describe("captureClaudeTranscriptCompletionEvidence", () => {
     ]));
   });
 
+  it("preserves a current names-only tool snapshot outside the hash-only trace", async () => {
+    const { root, sessionId, project } = await fixture();
+    await writeFile(
+      path.join(project, `${sessionId}.jsonl`),
+      JSON.stringify({ type: "user", timestamp: "2026-09-27T00:00:01Z", prompt_snapshot: { tools: [{ name: "Read" }, { name: "SubagentHandback" }] } }),
+    );
+    const evidence = await captureClaudeTranscriptCompletionEvidence({
+      configDir: root,
+      sessionId,
+      attemptStartedAt: "2026-09-27T00:00:00Z",
+      resumed: true,
+    });
+    expect(evidence).toMatchObject({
+      status: "unavailable",
+      files: [{ toolSchemaStatus: "available", promptSnapshotTools: [{ tools: [{ name: "Read" }, { name: "SubagentHandback" }] }] }],
+      transcriptTrace: { status: "unavailable", records: [] },
+    });
+  });
+
   it("excludes earlier resumed-session metadata from this attempt", async () => {
     const { root, sessionId, project } = await fixture();
     await writeFile(path.join(project, `${sessionId}.jsonl`), [

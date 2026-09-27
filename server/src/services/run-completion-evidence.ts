@@ -323,7 +323,12 @@ function transcriptFile(value: unknown): DurableTranscriptFile | null {
   };
 }
 
-function transcriptTrace(value: unknown, runId: string | undefined): DurableClaudeTranscriptTrace | null {
+function transcriptTrace(
+  value: unknown,
+  runId: string | undefined,
+  attemptStartedAt: number,
+  sourceFiles: DurableTranscriptFile[],
+): DurableClaudeTranscriptTrace | null {
   const trace = record(value);
   if (
     !trace || trace.schema !== "paperclip.claude-sanitized-transcript-trace.v1" ||
@@ -333,15 +338,18 @@ function transcriptTrace(value: unknown, runId: string | undefined): DurableClau
     !Array.isArray(trace.records) || trace.records.length > MAX_TRACE_RECORDS ||
     !Array.isArray(trace.parseGaps)
   ) return null;
+  const sourceKeys = new Set(sourceFiles.map((file) => `${file.role}:${file.fileName}:${file.sha256}`));
   const records: ClaudeTranscriptTrace["records"] = trace.records.flatMap((value) => {
     const item = record(value);
+    const recordTimestamp = item ? offsetTimestamp(item.timestamp) : null;
     if (
       !item || !FILE_RE.test(String(item.fileName ?? "")) ||
       !SHA256_RE.test(String(item.fileSha256 ?? "")) ||
       (item.role !== "parent" && item.role !== "child") ||
       !Number.isSafeInteger(item.line) || item.line < 1 ||
       (item.recordType !== null && !VALUE_RE.test(String(item.recordType))) ||
-      offsetTimestamp(item.timestamp) === null ||
+      recordTimestamp === null || Date.parse(recordTimestamp) < attemptStartedAt ||
+      !sourceKeys.has(`${item.role}:${item.fileName}:${String(item.fileSha256).toLowerCase()}`) ||
       (item.model !== null && !VALUE_RE.test(String(item.model))) ||
       (item.effort !== null && !VALUE_RE.test(String(item.effort))) ||
       !Array.isArray(item.toolSchemaHashes) || item.toolSchemaHashes.length > MAX_TRACE_SCHEMA_HASHES ||
@@ -353,7 +361,7 @@ function transcriptTrace(value: unknown, runId: string | undefined): DurableClau
       role: item.role as "parent" | "child",
       line: item.line as number,
       recordType: item.recordType === null ? null : item.recordType as string,
-      timestamp: item.timestamp as string,
+      timestamp: recordTimestamp,
       model: item.model === null ? null : item.model as string,
       effort: item.effort === null ? null : item.effort as string,
       toolSchemaHashes: (item.toolSchemaHashes as string[]).map((hash) => hash.toLowerCase()),
@@ -411,7 +419,12 @@ function transcriptEvidence(value: unknown, runId: string | undefined): DurableC
     .map(transcriptFile);
   if (files.some((file) => file === null)) return null;
   const durableFiles = files as DurableTranscriptFile[];
-  const durableTrace = transcriptTrace(evidence.transcriptTrace, runId);
+  const durableTrace = transcriptTrace(
+    evidence.transcriptTrace,
+    runId,
+    Date.parse(evidence.attempt.startedAt as string),
+    durableFiles,
+  );
   if (!durableTrace) return null;
   const parseGaps = [
     ...evidence.parseGaps

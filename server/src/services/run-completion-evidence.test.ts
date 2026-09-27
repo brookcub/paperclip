@@ -29,6 +29,17 @@ const traceRecords = [{
   effort: "low",
   toolSchemaHashes: ["b".repeat(64)],
 }];
+function traceWith(records: typeof traceRecords) {
+  return {
+    schema: "paperclip.claude-sanitized-transcript-trace.v1" as const,
+    status: "partial" as const,
+    scope: "timestamped_records_at_or_after_attempt_start" as const,
+    ordering: "source_file_then_line" as const,
+    records,
+    recordSetSha256: createHash("sha256").update(canonicalJson(records)).digest("hex"),
+    parseGaps: ["trace_is_transcript_derived"],
+  };
+}
 const transcript = {
   schema: "paperclip.claude-transcript-completion-evidence.v1" as const,
   status: "partial" as const,
@@ -36,15 +47,7 @@ const transcript = {
   sessionId: "session-123",
   toolSchemaProjection: "prompt_snapshot_safe_structure.v1" as const,
   attempt: { startedAt: "2026-09-26T23:59:59Z", resumed: false },
-  transcriptTrace: {
-    schema: "paperclip.claude-sanitized-transcript-trace.v1" as const,
-    status: "partial" as const,
-    scope: "timestamped_records_at_or_after_attempt_start" as const,
-    ordering: "source_file_then_line" as const,
-    records: traceRecords,
-    recordSetSha256: createHash("sha256").update(canonicalJson(traceRecords)).digest("hex"),
-    parseGaps: ["trace_is_transcript_derived"],
-  },
+  transcriptTrace: traceWith(traceRecords),
   files: [{
     role: "child" as const,
     fileName: "agent-child.jsonl",
@@ -219,6 +222,26 @@ describe("run completion evidence", () => {
       status: "unavailable",
       reason: "provider_trace_metadata_unavailable",
     });
+  });
+
+  it("rejects trace records that predate the attempt or cite a different selected file", () => {
+    for (const records of [
+      [{ ...traceRecords[0]!, timestamp: "2026-09-26T23:59:58Z" }],
+      [{ ...traceRecords[0]!, fileSha256: "c".repeat(64) }],
+    ]) {
+      const evidence = buildRunCompletionEvidence({
+        adapterType: "claude_local",
+        adapterResultJson: {
+          completionEvidence: { ...transcript, transcriptTrace: traceWith(records) },
+        },
+        providerTrace: null,
+        providerTraceRequested: false,
+      });
+      expect(evidence.transcript).toMatchObject({
+        status: "unavailable",
+        parseGaps: ["adapter_did_not_report_transcript_evidence"],
+      });
+    }
   });
 
   it("keeps storage limits explicit and readable", () => {

@@ -256,7 +256,7 @@ function inspectTranscript(
     const toolSchemaHashes = (tools ?? [])
       .map((tool) => tool.inputSchemaShapeSha256)
       .filter((hash): hash is string => hash !== null);
-    if (!model && !selectedEffort && toolSchemaHashes.length === 0) continue;
+    if (!model && !selectedEffort && tools === null) continue;
     const recordTimestamp = timestamp(record.timestamp);
     if (recordTimestamp === null) {
       trace.addGap("trace_record_timestamp_unavailable");
@@ -269,6 +269,7 @@ function inspectTranscript(
     if (model) models.add(model);
     if (selectedEffort) effort.add(selectedEffort);
     if (tools) promptSnapshotTools.push({ timestamp: recordTimestamp, tools });
+    if (!model && !selectedEffort && toolSchemaHashes.length === 0) continue;
     if (toolSchemaHashes.length > MAX_TRACE_SCHEMA_HASHES) {
       trace.addGap("trace_schema_hash_projection_truncated");
     }
