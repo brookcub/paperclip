@@ -17406,6 +17406,7 @@ export function heartbeatService(
       await cancelRunInternal(
         run.id,
         "Cancelled because the agent no longer exists",
+        { suppressNextQueuedRunStart: true },
       );
       return null;
     }
@@ -17416,6 +17417,7 @@ export function heartbeatService(
       await cancelRunInternal(
         run.id,
         `Cancelled because the agent is not invokable: ${invokability.reason}`,
+        { suppressNextQueuedRunStart: true },
       );
       return null;
     }
@@ -17430,7 +17432,9 @@ export function heartbeatService(
       },
     );
     if (budgetBlock) {
-      await cancelRunInternal(run.id, budgetBlock.reason);
+      await cancelRunInternal(run.id, budgetBlock.reason, {
+        suppressNextQueuedRunStart: true,
+      });
       return null;
     }
 
@@ -17468,6 +17472,7 @@ export function heartbeatService(
         await cancelRunInternal(
           run.id,
           "Cancelled because issue is held by an active subtree pause hold",
+          { suppressNextQueuedRunStart: true },
         );
         await logActivity(db, {
           companyId: run.companyId,
@@ -17547,6 +17552,7 @@ export function heartbeatService(
       await cancelRunInternal(run.id, reason, {
         errorCode: "required_capabilities_unavailable",
         resultJson: { requiredCapabilities: capabilityPreflight.result },
+        suppressNextQueuedRunStart: true,
       });
       const cancelled = await getRun(run.id);
       if (cancelled) {
@@ -19836,6 +19842,8 @@ export function heartbeatService(
           await cancelActiveForAgentInternal(
             agentId,
             `Cancelled because the agent is not invokable: ${invokability.reason}`,
+            "cancelled",
+            { suppressNextQueuedRunStart: true },
           );
         }
         return [];
@@ -28835,6 +28843,8 @@ export function heartbeatService(
     terminationGraceMs?: number;
     /** Caller is immediately scheduling an explicit successor path. */
     suppressImmediateRecovery?: boolean;
+    /** The enclosing queue scan will continue its own agent scheduling. */
+    suppressNextQueuedRunStart?: boolean;
   };
 
   function cancellationTerminationGraceMs(
@@ -29130,7 +29140,9 @@ export function heartbeatService(
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
-        await startNextQueuedRunForAgent(run.agentId);
+        if (!options.suppressNextQueuedRunStart) {
+          await startNextQueuedRunForAgent(run.agentId);
+        }
       }
       return cancelled;
     } finally {
@@ -29179,6 +29191,7 @@ export function heartbeatService(
     agentId: string,
     reason = "Cancelled due to agent pause",
     errorCode = "cancelled",
+    options: Pick<CancelRunOptions, "suppressNextQueuedRunStart"> = {},
   ) {
     const agent = await getAgent(agentId);
     const runs = await db
@@ -29198,7 +29211,7 @@ export function heartbeatService(
           : undefined;
       try {
         if (stopOwnership?.control) {
-          await cancelRunInternal(run.id, reason, { errorCode });
+          await cancelRunInternal(run.id, reason, { ...options, errorCode });
           continue;
         }
         if (run.runtimeMode === "native") {
