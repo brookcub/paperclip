@@ -292,6 +292,16 @@ describeEmbedded("heartbeat required capability admission", () => {
         pendingWakes: 1,
         quiescent: false,
       });
+      const [cancelled] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.companyId, companyId));
+      expect(cancelled).toMatchObject({
+        status: "cancelled",
+        startedAt: null,
+        errorCode: "required_capabilities_unavailable",
+      });
+      await db.update(issues).set({ executionPolicy: {} }).where(eq(issues.id, issueId));
 
       releaseStartLock();
       await heldStartLock;
