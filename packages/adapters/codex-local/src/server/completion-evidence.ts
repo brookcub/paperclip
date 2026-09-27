@@ -36,6 +36,7 @@ export type CodexRolloutCompletionEvidence = {
   };
   parseGaps: string[];
 };
+type DynamicTool = NonNullable<CodexRolloutCompletionEvidence["rollout"]>["dynamicTools"][number];
 
 const SESSION_ID_RE = /^[A-Za-z0-9-]{1,200}$/;
 const TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_.:/-]{0,200}$/;
