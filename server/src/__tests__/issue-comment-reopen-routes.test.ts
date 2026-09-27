@@ -1874,6 +1874,79 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  it("does not wake an assignee for its own unchanged blocked dependency write", async () => {
+    const assigneeAgentId = "22222222-2222-4222-8222-222222222222";
+    const issue = {
+      ...makeIssue("blocked"),
+      blockedTransitionAt: new Date("2026-09-27T00:00:00.000Z"),
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: issue.id,
+      blockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [{ id: "33333333-3333-4333-8333-333333333333" }],
+      blocks: [],
+    });
+
+    const res = await request(await installActor(createApp(), agentActor(assigneeAgentId)))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ blockedByIssueIds: ["33333333-3333-4333-8333-333333333333"] });
+
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      assigneeAgentId,
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
+  });
+
+  it("wakes an assignee when its blocked dependency state materially changes", async () => {
+    const assigneeAgentId = "22222222-2222-4222-8222-222222222222";
+    const issue = {
+      ...makeIssue("blocked"),
+      blockedTransitionAt: new Date("2026-09-27T00:00:00.000Z"),
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [{ id: "33333333-3333-4333-8333-333333333333" }],
+      blocks: [],
+    });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: issue.id,
+      blockerIssueIds: ["44444444-4444-4444-8444-444444444444"],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+
+    const res = await request(await installActor(createApp(), agentActor(assigneeAgentId)))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ blockedByIssueIds: ["44444444-4444-4444-8444-444444444444"] });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        assigneeAgentId,
+        expect.objectContaining({ reason: "issue_blockers_resolved" }),
+      ),
+    );
+  });
+
   it("moves in-progress issues with a scheduled retry back to todo via the PATCH comment path", async () => {
     const issue = {
       ...makeIssue("in_progress"),
