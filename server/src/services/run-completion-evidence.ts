@@ -365,17 +365,24 @@ function codexDynamicTool(value: unknown): CodexDynamicTool | null {
 
 function codexRolloutEvidence(value: unknown): DurableCodexRolloutEvidence | null {
   const evidence = record(value);
+  if (!evidence) return null;
+  const rawSessionId = evidence.sessionId;
+  const sessionId = rawSessionId === null
+    ? null
+    : typeof rawSessionId === "string" && ID_RE.test(rawSessionId)
+    ? rawSessionId
+    : null;
+  if (rawSessionId !== null && sessionId === null) return null;
   if (
-    !evidence || evidence.schema !== "paperclip.codex-rollout-completion-evidence.v1" ||
+    evidence.schema !== "paperclip.codex-rollout-completion-evidence.v1" ||
     evidence.source !== "codex_rollout_session" || evidence.toolSchemaCoverage !== "dynamic_tools_only_partial" ||
     !["partial", "unavailable"].includes(String(evidence.status)) ||
-    (!ID_RE.test(String(evidence.sessionId ?? "")) && evidence.sessionId !== null) ||
     !Array.isArray(evidence.parseGaps)
   ) return null;
   if (evidence.rollout === null) {
     return {
       schema: "paperclip.codex-rollout-completion-evidence.v1", status: "unavailable", source: "codex_rollout_session",
-      sessionId: evidence.sessionId, toolSchemaCoverage: "dynamic_tools_only_partial", rollout: null,
+      sessionId, toolSchemaCoverage: "dynamic_tools_only_partial", rollout: null,
       parseGaps: evidence.parseGaps.filter((gap): gap is string => typeof gap === "string" && VALUE_RE.test(gap)).slice(0, MAX_PARSE_GAPS),
     };
   }
@@ -397,7 +404,7 @@ function codexRolloutEvidence(value: unknown): DurableCodexRolloutEvidence | nul
   if (dynamicTools.some((tool) => tool === null)) return null;
   return {
     schema: "paperclip.codex-rollout-completion-evidence.v1", status: "partial", source: "codex_rollout_session",
-    sessionId: evidence.sessionId, toolSchemaCoverage: "dynamic_tools_only_partial",
+    sessionId, toolSchemaCoverage: "dynamic_tools_only_partial",
     rollout: {
       fileName: rollout.fileName, sha256: rollout.sha256.toLowerCase(), bytes: rollout.bytes,
       sessionBinding: "session_meta.payload.session_id",

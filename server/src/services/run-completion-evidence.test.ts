@@ -315,6 +315,40 @@ describe("run completion evidence", () => {
     expect(JSON.stringify(evidence)).not.toContain("a".repeat(64));
   });
 
+  it("rejects non-string Codex session identifiers while retaining explicit-null unavailability", () => {
+    for (const sessionId of [123, true]) {
+      const evidence = buildRunCompletionEvidence({
+        adapterType: "codex_local",
+        adapterResultJson: { completionEvidence: { ...codexRollout, sessionId } },
+        providerTrace: null,
+        providerTraceRequested: false,
+      });
+      expect(evidence.transcript).toMatchObject({
+        status: "unavailable",
+        parseGaps: ["adapter_did_not_report_rollout_evidence"],
+      });
+    }
+    const explicitUnavailable = buildRunCompletionEvidence({
+      adapterType: "codex_local",
+      adapterResultJson: {
+        completionEvidence: {
+          ...codexRollout,
+          status: "unavailable",
+          sessionId: null,
+          rollout: null,
+          parseGaps: ["codex_run_session_not_observed"],
+        },
+      },
+      providerTrace: null,
+      providerTraceRequested: false,
+    });
+    expect(explicitUnavailable.transcript).toMatchObject({
+      status: "unavailable",
+      sessionId: null,
+      parseGaps: ["codex_run_session_not_observed"],
+    });
+  });
+
   it("marks incomplete or expired trace metadata without a usable pointer", () => {
     const incomplete = buildRunCompletionEvidence({
       adapterType: "claude_local",
