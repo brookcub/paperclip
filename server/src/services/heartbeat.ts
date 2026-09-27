@@ -8,7 +8,7 @@ import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAs
 import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
-import { aiConnectionBindingSchema } from "@paperclipai/shared";
+import { aiConnectionBindingSchema, type PermissionKey } from "@paperclipai/shared";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
@@ -151,7 +151,6 @@ import {
   toolConnections,
   toolProfileEntries,
   toolProfiles,
-  principalPermissionGrants,
   workspaceOperations,
 } from "@paperclipai/db";
 import { conflict, HttpError, notFound } from "../errors.js";
@@ -392,6 +391,7 @@ import {
 } from "./authorization.js";
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
+import { accessService } from "./access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
@@ -17085,25 +17085,40 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     const requirements = readRequiredCapabilities(issue?.executionPolicy);
     if (requirements.length === 0) return null;
-    const [grants, tools, runScopedSkillKeys] = await Promise.all([
-      db.select({ permissionKey: principalPermissionGrants.permissionKey })
-        .from(principalPermissionGrants)
-        .where(and(
-          eq(principalPermissionGrants.companyId, agent.companyId),
-          eq(principalPermissionGrants.principalType, "agent"),
-          eq(principalPermissionGrants.principalId, agent.id),
-        )),
+    const permissionKeys = requirements
+      .filter((requirement) =>
+        requirement.kind === "permission" && (!requirement.when || requirement.when.agentId === agent.id),
+      )
+      .flatMap((requirement) => requirement.kind === "permission" ? [requirement.key] : [])
+      .sort();
+    const [tools, runScopedSkillKeys, allowedAgentPermissionKeys] = await Promise.all([
       toolAccessService(db).getEffectiveProfilesForAgent(agent.companyId, agent.id),
       resolveRunScopedMentionedSkillKeys({ db, companyId: agent.companyId, issueId }),
+      Promise.all(permissionKeys.map(async (permissionKey) =>
+        (await accessService(db).hasPermission(
+          agent.companyId,
+          "agent",
+          agent.id,
+          permissionKey as PermissionKey,
+        )) ? permissionKey : null,
+      )).then((keys) => keys.filter((key): key is string => key !== null)),
     ]);
     const snapshot: CapabilityPreflightSnapshot = {
       issueId,
+      agentId: agent.id,
       issueUpdatedAt: issue!.updatedAt.toISOString(),
       executionPolicy: stableCapabilitySnapshot(issue!.executionPolicy),
       agentUpdatedAt: agent.updatedAt.toISOString(),
       adapterType: agent.adapterType,
       adapterConfig: stableCapabilitySnapshot(agent.adapterConfig),
-      agentPermissionKeys: grants.map((grant) => grant.permissionKey).sort(),
+      permissionKeys,
+      allowedAgentPermissionKeys,
+      managedMcpRevision: stableCapabilitySnapshot({
+        names: tools.allowedToolNames.slice().sort(),
+        profiles: tools.profiles.map((profile) => [profile.id, profile.updatedAt.toISOString()]).sort(),
+        entries: tools.entries.map((entry) => [entry.id, entry.updatedAt.toISOString()]).sort(),
+        bindings: tools.bindings.map((binding) => [binding.id, binding.updatedAt.toISOString()]).sort(),
+      }),
     };
     // Dispatch applies an issue override and mention-scoped keys later. Do not
     // certify the agent default when either would change that effective input.
@@ -17140,9 +17155,14 @@ export function heartbeatService(
       requirements,
       adapterType: agent.adapterType,
       adapterConfig: config,
+      agentId: agent.id,
       targetIsRemote: false,
       selectedSkillKeys: selected,
-      agentPermissionKeys: grants.map((grant) => grant.permissionKey),
+      // Runtime materialization reads skill files outside the lock. Until its
+      // source revision has an in-lock authority, keep a selected skill
+      // requirement unknown rather than certifying a stale file.
+      skillSelectionsVerified: false,
+      agentPermissionKeys: allowedAgentPermissionKeys,
       managedMcpToolNames: tools.allowedToolNames,
       }),
       snapshot,
@@ -17156,7 +17176,7 @@ export function heartbeatService(
     snapshot: CapabilityPreflightSnapshot | null,
   ): Promise<boolean> {
     if (!snapshot) return true;
-    const [issue, currentAgent, grants] = await Promise.all([
+    const [issue, currentAgent, tools, allowedAgentPermissionKeys] = await Promise.all([
       tx.select({ executionPolicy: issues.executionPolicy, updatedAt: issues.updatedAt })
         .from(issues)
         .where(and(eq(issues.id, snapshot.issueId), eq(issues.companyId, run.companyId)))
@@ -17167,23 +17187,33 @@ export function heartbeatService(
         .where(and(eq(agents.id, agent.id), eq(agents.companyId, run.companyId)))
         .limit(1)
         .then((rows) => rows[0] ?? null),
-      tx.select({ permissionKey: principalPermissionGrants.permissionKey })
-        .from(principalPermissionGrants)
-        .where(and(
-          eq(principalPermissionGrants.companyId, run.companyId),
-          eq(principalPermissionGrants.principalType, "agent"),
-          eq(principalPermissionGrants.principalId, agent.id),
-        )),
+      toolAccessService(tx).getEffectiveProfilesForAgent(run.companyId, agent.id),
+      Promise.all(snapshot.permissionKeys.map(async (permissionKey) =>
+        (await accessService(tx).hasPermission(
+          run.companyId,
+          "agent",
+          agent.id,
+          permissionKey as PermissionKey,
+        )) ? permissionKey : null,
+      )).then((keys) => keys.filter((key): key is string => key !== null)),
     ]);
     if (!issue || !currentAgent) return false;
     return capabilityPreflightSnapshotIsCurrent(snapshot, {
       issueId: snapshot.issueId,
+      agentId: agent.id,
       issueUpdatedAt: issue.updatedAt.toISOString(),
       executionPolicy: stableCapabilitySnapshot(issue.executionPolicy),
       agentUpdatedAt: currentAgent.updatedAt.toISOString(),
       adapterType: currentAgent.adapterType,
       adapterConfig: stableCapabilitySnapshot(currentAgent.adapterConfig),
-      agentPermissionKeys: grants.map((grant) => grant.permissionKey).sort(),
+      permissionKeys: snapshot.permissionKeys,
+      allowedAgentPermissionKeys,
+      managedMcpRevision: stableCapabilitySnapshot({
+        names: tools.allowedToolNames.slice().sort(),
+        profiles: tools.profiles.map((profile) => [profile.id, profile.updatedAt.toISOString()]).sort(),
+        entries: tools.entries.map((entry) => [entry.id, entry.updatedAt.toISOString()]).sort(),
+        bindings: tools.bindings.map((binding) => [binding.id, binding.updatedAt.toISOString()]).sort(),
+      }),
     });
   }
 

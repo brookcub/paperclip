@@ -436,16 +436,19 @@ const requiredCapabilitySchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("skill"),
     key: z.string().trim().min(1).max(200),
+    when: z.object({ agentId: z.string().guid() }).strict().optional(),
   }).strict(),
   z.object({
     kind: z.literal("tool"),
     runtime: z.enum(["claude_cli", "codex_cli", "paperclip_mcp"]),
     name: z.string().trim().min(1).max(128),
     authorization: z.enum(["conditional_ok", "must_not_prompt"]),
+    when: z.object({ agentId: z.string().guid() }).strict().optional(),
   }).strict(),
   z.object({
     kind: z.literal("permission"),
     key: z.enum(PERMISSION_KEYS),
+    when: z.object({ agentId: z.string().guid() }).strict().optional(),
   }).strict(),
 ]);
 

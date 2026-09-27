@@ -17,6 +17,10 @@ export const SANDBOX_ALLOWED_TOOLS =
   "NotebookEdit PushNotification Read RemoteTrigger ScheduleWakeup Skill " +
   "TaskOutput TaskStop TodoWrite ToolSearch WebFetch WebSearch Write";
 
+// The local pilot has exercised this bounded built-in subset. Do not derive
+// local presence from the remote-target allowlist above.
+const LOCAL_CLI_PROVEN_TOOLS = new Set(["Bash", "Read", "Grep", "Glob"]);
+
 function shouldUseAllowedTools(input: { targetIsRemote: boolean; localProcessUid?: number | null }): boolean {
   // Claude Code refuses `--dangerously-skip-permissions` when the process runs
   // as root. Use the same explicit allowlist that remote targets use so local
@@ -37,23 +41,49 @@ function strings(value: unknown): string[] {
   return value.filter((entry): entry is string => typeof entry === "string");
 }
 
-function flagValues(args: string[], flag: string): string[] | null {
+function record(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function configuredArgs(config: Record<string, unknown>): string[] {
+  const extra = strings(config.extraArgs);
+  return extra.length > 0 ? extra : strings(config.args);
+}
+
+type FlagValues = { found: boolean; values: string[]; unsupported: boolean };
+
+function flagValues(args: string[], flags: string[]): FlagValues {
   const values: string[] = [];
   let found = false;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
+    const flag = flags.find((candidate) => arg === candidate || arg.startsWith(`${candidate}=`));
+    if (!flag) continue;
     if (arg === flag) {
       found = true;
       const next = args[index + 1];
-      if (typeof next !== "string" || next.startsWith("-")) return null;
+      if (typeof next !== "string" || next.startsWith("-")) return { found, values, unsupported: true };
       values.push(next);
       index += 1;
-    } else if (arg.startsWith(`${flag}=`)) {
+      if (typeof args[index + 1] === "string" && !args[index + 1]!.startsWith("-")) {
+        return { found, values, unsupported: true };
+      }
+    } else {
       found = true;
       values.push(arg.slice(flag.length + 1));
     }
   }
-  return found ? values.flatMap((value) => value.split(/[\s,]+/).filter(Boolean)) : [];
+  return {
+    found,
+    values: values.flatMap((value) => value.split(/[\s,]+/).filter(Boolean)),
+    unsupported: false,
+  };
+}
+
+function hasUnsupportedSelector(values: string[]): boolean {
+  return values.some((value) => /[()*?]/.test(value));
 }
 
 /**
@@ -68,36 +98,40 @@ export function resolveClaudeStaticToolPolicy(input: {
   targetIsRemote: boolean;
   localProcessUid?: number | null;
 }): StaticToolPolicy {
-  const extraArgs = strings(input.config.extraArgs);
+  const extraArgs = configuredArgs(input.config);
   if (extraArgs.some((arg) => /^(--settings|--setting-sources)(?:=|$)/.test(arg))) {
     return { present: false, authorization: "unknown", reason: "custom_settings_override" };
   }
-  const tools = flagValues(extraArgs, "--tools");
-  const allow = [
-    flagValues(extraArgs, "--allowedTools"),
-    flagValues(extraArgs, "--allowed-tools"),
-  ];
-  const deny = [
-    flagValues(extraArgs, "--disallowedTools"),
-    flagValues(extraArgs, "--disallowed-tools"),
-  ];
-  const mode = flagValues(extraArgs, "--permission-mode");
-  if (tools === null || allow.some((value) => value === null) || deny.some((value) => value === null) || mode === null || mode.length > 1) {
+  if (input.config.managedAiConnection === true ||
+    Object.prototype.hasOwnProperty.call(record(input.config.env), "CLAUDE_CONFIG_DIR")) {
+    return { present: false, authorization: "unknown", reason: "ambient_settings_source" };
+  }
+  const tools = flagValues(extraArgs, ["--tools"]);
+  const allow = flagValues(extraArgs, ["--allowedTools", "--allowed-tools"]);
+  const deny = flagValues(extraArgs, ["--disallowedTools", "--disallowed-tools"]);
+  const mode = flagValues(extraArgs, ["--permission-mode"]);
+  if (tools.unsupported || allow.unsupported || deny.unsupported || mode.unsupported || mode.values.length > 1 ||
+    hasUnsupportedSelector(tools.values) || hasUnsupportedSelector(allow.values) || hasUnsupportedSelector(deny.values)) {
     return { present: false, authorization: "unknown", reason: "unsupported_permission_override" };
   }
-  const builtin = new Set(SANDBOX_ALLOWED_TOOLS.split(" "));
-  const allowedTools = allow.flatMap((value) => value ?? []);
-  const deniedTools = deny.flatMap((value) => value ?? []);
-  const exactDenied = deniedTools.some((entry) => entry === input.tool);
-  const explicitlyPresent = tools.length === 0 || tools.includes("default") || tools.includes(input.tool);
-  if (!builtin.has(input.tool) || !explicitlyPresent || exactDenied) {
+  const builtin = input.targetIsRemote
+    ? new Set(SANDBOX_ALLOWED_TOOLS.split(" "))
+    : LOCAL_CLI_PROVEN_TOOLS;
+  const exactDenied = deny.values.some((entry) => entry === input.tool);
+  const explicitlyPresent = tools.found
+    ? tools.values.includes(input.tool)
+    : builtin.has(input.tool);
+  if (!builtin.has(input.tool)) {
+    return { present: false, authorization: "unknown", reason: "tool_presence_not_qualified" };
+  }
+  if (!explicitlyPresent || exactDenied) {
     return { present: false, authorization: "denied", reason: exactDenied ? "tool_disallowed" : "tool_not_selected" };
   }
   const bypass = input.config.dangerouslySkipPermissions !== false &&
     !shouldUseAllowedTools(input);
   if (bypass) return { present: true, authorization: "unprompted", reason: "dangerously_skip_permissions" };
-  if (allowedTools.includes(input.tool)) return { present: true, authorization: "unprompted", reason: "explicit_allowed_tool" };
-  if (mode[0] === "dontAsk") return { present: true, authorization: "denied", reason: "permission_mode_dont_ask" };
+  if (allow.values.includes(input.tool)) return { present: true, authorization: "unprompted", reason: "explicit_allowed_tool" };
+  if (mode.values[0] === "dontAsk") return { present: true, authorization: "denied", reason: "permission_mode_dont_ask" };
   return { present: true, authorization: "conditional", reason: "provider_permission_policy" };
 }
 

@@ -43,6 +43,9 @@ export function resolveCodexShellPolicy(config: unknown): CodexShellPolicy {
   if (extraArgs.some((arg) => /^(--profile|-p|--config|-c)(?:=|$)/.test(arg))) {
     return { present: true, authorization: "unknown", reason: "custom_config_override" };
   }
+  if (extraArgs.some((arg) => arg === "--disable" || arg === "--disable=shell_tool" || arg === "shell_tool")) {
+    return { present: false, authorization: "unknown", reason: "shell_tool_override" };
+  }
   const bypass = asBoolean(record.dangerouslyBypassApprovalsAndSandbox,
     asBoolean(record.dangerouslyBypassSandbox, false));
   if (bypass || extraArgs.includes("--dangerously-bypass-approvals-and-sandbox")) {

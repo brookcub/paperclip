@@ -29,6 +29,27 @@ describe("claude-local remote permission args", () => {
     })).toMatchObject({ present: true, authorization: "denied" });
   });
 
+  it("fails closed for an empty tools selection, variadic flags, and command selectors", () => {
+    expect(resolveClaudeStaticToolPolicy({
+      config: { extraArgs: ["--tools", ""] }, tool: "Bash", targetIsRemote: false,
+    })).toMatchObject({ present: false, authorization: "denied", reason: "tool_not_selected" });
+    expect(resolveClaudeStaticToolPolicy({
+      config: { extraArgs: ["--disallowedTools", "Read", "Bash"] }, tool: "Bash", targetIsRemote: false,
+    })).toMatchObject({ authorization: "unknown", reason: "unsupported_permission_override" });
+    expect(resolveClaudeStaticToolPolicy({
+      config: { extraArgs: ["--disallowedTools=Bash(*)"] }, tool: "Bash", targetIsRemote: false,
+    })).toMatchObject({ authorization: "unknown", reason: "unsupported_permission_override" });
+  });
+
+  it("does not infer local tool presence from the remote allowlist or ambient settings", () => {
+    expect(resolveClaudeStaticToolPolicy({
+      config: {}, tool: "WebSearch", targetIsRemote: false,
+    })).toMatchObject({ authorization: "unknown", reason: "tool_presence_not_qualified" });
+    expect(resolveClaudeStaticToolPolicy({
+      config: { managedAiConnection: true }, tool: "Bash", targetIsRemote: false,
+    })).toMatchObject({ authorization: "unknown", reason: "ambient_settings_source" });
+  });
+
   it("uses the canonical Bash tool grant for remote execution", () => {
     expect(buildClaudeExecutionPermissionArgs({ dangerouslySkipPermissions: true, targetIsRemote: true })).toEqual([
       "--allowedTools",

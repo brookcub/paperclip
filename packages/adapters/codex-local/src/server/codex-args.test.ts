@@ -6,6 +6,7 @@ describe("buildCodexExecArgs", () => {
     expect(resolveCodexShellPolicy({ engine: "cli" })).toMatchObject({ present: true, authorization: "conditional" });
     expect(resolveCodexShellPolicy({ engine: "cli", extraArgs: ["--profile", "operator"] })).toMatchObject({ present: true, authorization: "unknown" });
     expect(resolveCodexShellPolicy({ engine: "acp" })).toMatchObject({ present: false, authorization: "unknown" });
+    expect(resolveCodexShellPolicy({ engine: "cli", extraArgs: ["--disable", "shell_tool"] })).toMatchObject({ present: false, authorization: "unknown", reason: "shell_tool_override" });
   });
 
   it("forwards GPT-6 Astra, its ultra reasoning effort, and fast mode", () => {

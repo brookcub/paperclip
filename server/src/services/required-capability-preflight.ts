@@ -1,11 +1,11 @@
 import { resolveClaudeStaticToolPolicy } from "@paperclipai/adapter-claude-local/server";
 import { resolveCodexShellPolicy } from "@paperclipai/adapter-codex-local/server";
-import { PERMISSION_KEYS } from "@paperclipai/shared";
+import { requiredCapabilitiesSchema } from "@paperclipai/shared";
 
 type Requirement =
-  | { kind: "skill"; key: string }
-  | { kind: "permission"; key: string }
-  | { kind: "tool"; runtime: "claude_cli" | "codex_cli" | "paperclip_mcp"; name: string; authorization: "conditional_ok" | "must_not_prompt" }
+  | { kind: "skill"; key: string; when?: { agentId: string } }
+  | { kind: "permission"; key: string; when?: { agentId: string } }
+  | { kind: "tool"; runtime: "claude_cli" | "codex_cli" | "paperclip_mcp"; name: string; authorization: "conditional_ok" | "must_not_prompt"; when?: { agentId: string } }
   | { kind: "invalid"; id: string };
 
 export type CapabilityPreflightResult = {
@@ -17,12 +17,15 @@ export type CapabilityPreflightResult = {
 
 export type CapabilityPreflightSnapshot = {
   issueId: string;
+  agentId: string;
   issueUpdatedAt: string;
   executionPolicy: string;
   agentUpdatedAt: string;
   adapterType: string;
   adapterConfig: string;
-  agentPermissionKeys: string[];
+  permissionKeys: string[];
+  allowedAgentPermissionKeys: string[];
+  managedMcpRevision: string;
 };
 
 export type CapabilityPreflight = {
@@ -44,13 +47,17 @@ export function capabilityPreflightSnapshotIsCurrent(
   current: CapabilityPreflightSnapshot,
 ): boolean {
   return snapshot.issueId === current.issueId &&
+    snapshot.agentId === current.agentId &&
     snapshot.issueUpdatedAt === current.issueUpdatedAt &&
     snapshot.executionPolicy === current.executionPolicy &&
     snapshot.agentUpdatedAt === current.agentUpdatedAt &&
     snapshot.adapterType === current.adapterType &&
     snapshot.adapterConfig === current.adapterConfig &&
-    snapshot.agentPermissionKeys.length === current.agentPermissionKeys.length &&
-    snapshot.agentPermissionKeys.every((key, index) => key === current.agentPermissionKeys[index]);
+    snapshot.permissionKeys.length === current.permissionKeys.length &&
+    snapshot.permissionKeys.every((key, index) => key === current.permissionKeys[index]) &&
+    snapshot.allowedAgentPermissionKeys.length === current.allowedAgentPermissionKeys.length &&
+    snapshot.allowedAgentPermissionKeys.every((key, index) => key === current.allowedAgentPermissionKeys[index]) &&
+    snapshot.managedMcpRevision === current.managedMcpRevision;
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -61,28 +68,20 @@ function record(value: unknown): Record<string, unknown> {
 
 export function readRequiredCapabilities(value: unknown): Requirement[] {
   const policy = record(value);
-  const required = record(policy.requiredCapabilities);
-  if (required.version !== 1 || !Array.isArray(required.items)) return [];
+  if (policy.requiredCapabilities === undefined || policy.requiredCapabilities === null) return [];
+  const parsed = requiredCapabilitiesSchema.safeParse(policy.requiredCapabilities);
+  if (!parsed.success) return [{ kind: "invalid", id: "required_capability_catalog_invalid" }];
   const seen = new Set<string>();
   const items: Requirement[] = [];
-  let invalid = false;
-  for (const raw of required.items) {
-    const item = record(raw);
-    if (item.kind === "skill" && typeof item.key === "string") {
-      const key = item.key.trim();
-      if (key) items.push({ kind: "skill", key }); else invalid = true;
-    } else if (item.kind === "permission" && typeof item.key === "string" && PERMISSION_KEYS.includes(item.key as (typeof PERMISSION_KEYS)[number])) {
-      const key = item.key.trim();
-      if (key) items.push({ kind: "permission", key }); else invalid = true;
-    } else if (item.kind === "tool" &&
-      (item.runtime === "claude_cli" || item.runtime === "codex_cli" || item.runtime === "paperclip_mcp") &&
-      typeof item.name === "string" &&
-      (item.authorization === "conditional_ok" || item.authorization === "must_not_prompt")) {
-      const name = item.name.trim();
-      if (name) items.push({ kind: "tool", runtime: item.runtime, name, authorization: item.authorization }); else invalid = true;
-    } else invalid = true;
+  for (const item of parsed.data.items) {
+    if (item.kind === "skill") {
+      items.push({ kind: "skill", key: item.key, ...(item.when ? { when: item.when } : {}) });
+    } else if (item.kind === "permission") {
+      items.push({ kind: "permission", key: item.key, ...(item.when ? { when: item.when } : {}) });
+    } else {
+      items.push({ kind: "tool", runtime: item.runtime, name: item.name, authorization: item.authorization, ...(item.when ? { when: item.when } : {}) });
+    }
   }
-  if (invalid) items.push({ kind: "invalid", id: "required_capability_catalog_invalid" });
   return items.filter((item) => {
     const key = JSON.stringify(item);
     if (seen.has(key)) return false;
@@ -92,19 +91,24 @@ export function readRequiredCapabilities(value: unknown): Requirement[] {
 }
 
 export function capabilityRequirementId(requirement: Requirement): string {
-  return requirement.kind === "tool"
+  const id = requirement.kind === "tool"
     ? `tool:${requirement.runtime}:${requirement.name}`
     : requirement.kind === "invalid"
       ? requirement.id
       : `${requirement.kind}:${requirement.key}`;
+  return requirement.kind !== "invalid" && requirement.when
+    ? `${id}@agent:${requirement.when.agentId}`
+    : id;
 }
 
 export function evaluateRequiredCapabilities(input: {
   requirements: Requirement[];
   adapterType: string;
   adapterConfig: Record<string, unknown>;
+  agentId: string;
   targetIsRemote: boolean;
   selectedSkillKeys: Iterable<string>;
+  skillSelectionsVerified: boolean;
   agentPermissionKeys: Iterable<string>;
   managedMcpToolNames: Iterable<string>;
 }): CapabilityPreflightResult {
@@ -113,7 +117,13 @@ export function evaluateRequiredCapabilities(input: {
   const mcp = new Set(input.managedMcpToolNames);
   const unmet: CapabilityPreflightResult["unmet"] = [];
   const admittedPolicy: CapabilityPreflightResult["admittedPolicy"] = [];
-  for (const requirement of input.requirements) {
+  const applicable = input.requirements.filter((requirement) =>
+    requirement.kind === "invalid" || !requirement.when || requirement.when.agentId === input.agentId,
+  );
+  if (applicable.length === 0) {
+    unmet.push({ id: `agent:${input.agentId}`, state: "missing", reason: "actor_requirements_missing" });
+  }
+  for (const requirement of applicable) {
     const id = capabilityRequirementId(requirement);
     if (requirement.kind === "invalid") {
       unmet.push({ id, state: "unknown", reason: "required_capability_catalog_invalid" });
@@ -121,6 +131,7 @@ export function evaluateRequiredCapabilities(input: {
     }
     if (requirement.kind === "skill") {
       if (!skills.has(requirement.key)) unmet.push({ id, state: "missing", reason: "skill_not_selected" });
+      else if (!input.skillSelectionsVerified) unmet.push({ id, state: "unknown", reason: "skill_revision_not_rechecked" });
       continue;
     }
     if (requirement.kind === "permission") {
