@@ -48,6 +48,7 @@ import {
   closeRegisteredClients,
   documentRevisions,
   documents,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   environmentLeases,
   environments,
   executionWorkspaces,
@@ -472,7 +473,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       createdAt: now,
       updatedAt: now,
     });
-  }, 20_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     vi.clearAllMocks();
@@ -1710,6 +1711,158 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
     expect(wake.status).toBe("deferred_issue_execution");
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+  });
+
+  it("retires a settled legacy no-replay hold only after a later material authority change", async () => {
+    const held = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "cancelled", runErrorCode: "issue_assignee_changed" });
+    const [heldRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, held.runId));
+    await terminalizeLegacyExecution({ db, run: heldRun!, status: "cancelled" });
+    await db.insert(issueComments).values({ companyId: held.companyId, issueId: held.issueId, authorUserId: "responsible-user", body: "Keep the stop in place." });
+    const { settleUnrecoverableExecutions } = await import("../services/execution-recovery-resolution.js");
+    await settleUnrecoverableExecutions(db);
+    const [heldAction, heldIssue] = await Promise.all([
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, held.issueId)).then(rows => rows[0]),
+      db.select().from(issues).where(eq(issues.id, held.issueId)).then(rows => rows[0]),
+    ]);
+    expect(heldAction).toMatchObject({ outcome: "blocked", evidence: expect.objectContaining({ automaticRecovery: expect.objectContaining({ replay: "blocked" }) }) });
+    expect(heldIssue?.status).toBe("blocked");
+
+    const superseded = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "cancelled", runErrorCode: "issue_assignee_changed" });
+    const [supersededRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, superseded.runId));
+    await terminalizeLegacyExecution({ db, run: supersededRun!, status: "cancelled" });
+    await settleUnrecoverableExecutions(db);
+    const [blockedAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, superseded.issueId));
+    expect(blockedAction).toMatchObject({
+      outcome: "blocked",
+      evidence: expect.objectContaining({
+        settledAuthorityProjection: expect.objectContaining({ status: "blocked" }),
+        automaticRecovery: expect.objectContaining({ replay: "blocked", actionOutcome: "unknown" }),
+      }),
+    });
+
+    await db.update(issues).set({
+      status: "in_review", statusVersion: sql`${issues.statusVersion} + 1`, assigneeAgentId: superseded.agentId,
+      executionState: { status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review", currentParticipant: { type: "agent", agentId: superseded.agentId, userId: null }, returnAssignee: { type: "agent", agentId: superseded.agentId, userId: null }, reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null },
+    }).where(eq(issues.id, superseded.issueId));
+    await settleUnrecoverableExecutions(db);
+    const [supersededAction, supersededIssue] = await Promise.all([
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, superseded.issueId)).then(rows => rows[0]),
+      db.select().from(issues).where(eq(issues.id, superseded.issueId)).then(rows => rows[0]),
+    ]);
+    expect(supersededAction).toMatchObject({ outcome: "blocked", evidence: expect.objectContaining({ automaticRecovery: expect.objectContaining({ replay: "superseded", actionOutcome: "unknown" }) }) });
+    expect(supersededIssue).toMatchObject({ status: "in_review", assigneeAgentId: superseded.agentId });
+    expect(await getExecutionBlocker(db, superseded.companyId, superseded.issueId)).toBeNull();
+    const [revisitedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, superseded.runId));
+    await terminalizeLegacyExecution({ db, run: revisitedRun!, status: "cancelled" });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, superseded.issueId))).toHaveLength(1);
+  });
+
+  it("does not invent an action outcome when a pre-settlement authority change prevents recovery", async () => {
+    const fixture = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "cancelled", runErrorCode: "issue_assignee_changed" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    await terminalizeLegacyExecution({ db, run: run!, status: "cancelled" });
+    await db.update(issues).set({
+      status: "in_review",
+      statusVersion: sql`${issues.statusVersion} + 1`,
+      assigneeAgentId: fixture.agentId,
+      executionState: { status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review", currentParticipant: { type: "agent", agentId: fixture.agentId, userId: null }, returnAssignee: { type: "agent", agentId: fixture.agentId, userId: null }, reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null },
+    }).where(eq(issues.id, fixture.issueId));
+    const { settleUnrecoverableExecutions } = await import("../services/execution-recovery-resolution.js");
+    await settleUnrecoverableExecutions(db);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId));
+    expect(action).toMatchObject({
+      evidence: expect.objectContaining({ automaticRecovery: expect.objectContaining({ replay: "superseded" }) }),
+    });
+    expect(action!.evidence.automaticRecovery).not.toHaveProperty("actionOutcome");
+  });
+
+  it("scans past unchanged and malformed resolved holds to retire a later material change", async () => {
+    const fixture = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "cancelled", runErrorCode: "issue_assignee_changed" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    const projection = {
+      status: "todo",
+      statusVersion: issue!.statusVersion,
+      lastStatusDecisionId: issue!.lastStatusDecisionId,
+      assigneeAgentId: issue!.assigneeAgentId,
+      assigneeUserId: issue!.assigneeUserId,
+      executionRunId: issue!.executionRunId,
+      checkoutRunId: issue!.checkoutRunId,
+      hiddenAt: issue!.hiddenAt?.toISOString() ?? null,
+      reviewStageId: null,
+      reviewParticipantAgentId: null,
+      reviewParticipantUserId: null,
+    };
+    const common = {
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.issueId,
+      kind: "active_run_watchdog" as const,
+      status: "resolved" as const,
+      ownerType: "board" as const,
+      returnOwnerAgentId: fixture.agentId,
+      cause: "legacy_execution_requires_reconciliation",
+      outcome: "blocked",
+      nextAction: "Keep the recorded execution hold.",
+    };
+    const malformed = Array.from({ length: 26 }, (_, index) => ({
+      ...common,
+      id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      fingerprint: `malformed-${index}`,
+      evidence: {
+        automaticRecovery: { replay: "blocked", actionOutcome: "unknown" },
+        settledAuthorityProjection: { ...projection, statusVersion: -1 },
+      },
+    }));
+    const changedId = "00000000-0000-4000-8000-000000000027";
+    await db.insert(issueRecoveryActions).values([
+      ...malformed,
+      {
+        ...common,
+        id: changedId,
+        fingerprint: "later-material-change",
+        evidence: {
+          automaticRecovery: { replay: "blocked", actionOutcome: "unknown" },
+          settledAuthorityProjection: projection,
+        },
+      },
+    ]);
+    const { settleUnrecoverableExecutions } = await import("../services/execution-recovery-resolution.js");
+    await settleUnrecoverableExecutions(db);
+    const [unchanged, changed] = await Promise.all([
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, malformed[0]!.id)).then(rows => rows[0]),
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, changedId)).then(rows => rows[0]),
+    ]);
+    expect(unchanged!.evidence.automaticRecovery).toMatchObject({ replay: "blocked", actionOutcome: "unknown" });
+    expect(changed!.evidence.automaticRecovery).toMatchObject({ replay: "superseded", actionOutcome: "unknown" });
+  });
+
+  it("does not add a legacy hold when a different supported cause already reconciled the run", async () => {
+    const fixture = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "cancelled", runErrorCode: "issue_assignee_changed" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+    await db.insert(issueRecoveryActions).values({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.issueId,
+      kind: "active_run_watchdog",
+      status: "resolved",
+      ownerType: "board",
+      returnOwnerAgentId: fixture.agentId,
+      cause: "uncertain_external_action",
+      fingerprint: `reconciled:${fixture.runId}`,
+      outcome: "restored",
+      nextAction: "The provider stop was reconciled.",
+      evidence: {
+        executionReconciliation: {
+          runId: fixture.runId,
+          providerStopped: true,
+          actionOutcome: "not_performed",
+          outcomeEvidence: "The pre-dispatch provider receipt has no external effect.",
+        },
+      },
+    });
+    await terminalizeLegacyExecution({ db, run: run!, status: "cancelled" });
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, fixture.issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]!.cause).toBe("uncertain_external_action");
   });
 
   it("leaves hidden issues out of stranded-issue reconciliation", async () => {
@@ -6985,7 +7138,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(next?.contextSnapshot?.wakeCommentIds).toEqual([pending!.id, go!.id]);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id)))[0]).toMatchObject({ status: "coalesced", runId: next!.id });
-    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
+    await heartbeat.drainActiveRunExecutions();
+    expect((await heartbeat.getRun(next!.id))?.status).toBe("succeeded");
   });
 
   it.each(["dedicated deferred donor", "non-coalescing recipient", "persistent agent conversation"] as const)(

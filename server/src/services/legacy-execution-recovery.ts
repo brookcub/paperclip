@@ -4,9 +4,10 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { projectSourceAuthority } from "./source-authority-binding.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
@@ -112,6 +113,18 @@ export async function terminalizeLegacyExecution(input: {
     ) {
       // Periodic stranded-work checks may revisit this terminal run before its
       // reconciled continuation is dispatched. Preserve the recorded decision.
+      const [recorded] = await tx.select({ id: issueRecoveryActions.id })
+        .from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, run.companyId),
+          eq(issueRecoveryActions.sourceIssueId, task.id),
+          eq(issueRecoveryActions.kind, "active_run_watchdog"),
+          eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+          sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+        )).limit(1);
+      if (recorded) return updated;
+      // A different supported recovery cause can already have an accepted
+      // reconciliation for this exact execution. That is distinct from this
+      // legacy record's dedupe and must not manufacture a second hold.
       const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
@@ -130,6 +143,7 @@ export async function terminalizeLegacyExecution(input: {
         fingerprint: `legacy-execution:${run.id}`,
         evidence: {
           runId: run.id,
+          sourceAuthorityBinding: projectSourceAuthority(task, run.id),
           ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),
           originalFailureCode: updated.errorCode,
           adapterRecovery: "unsupported_or_unknown",

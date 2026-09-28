@@ -27223,6 +27223,55 @@ export function heartbeatService(
           }
 
           let reconciledSourceRunId: string | null = null;
+          let reconciliationDelivery: {
+            actionId: string;
+            sourceRunId: string;
+            decision: Record<string, unknown>;
+            adoptedWakeId: string | null;
+          } | null = null;
+          const recordReconciliationDelivery = async (runId: string) => {
+            const delivery = reconciliationDelivery;
+            if (!delivery) return;
+            await tx
+              .update(heartbeatRuns)
+              .set({ retryOfRunId: delivery.sourceRunId })
+              .where(and(
+                eq(heartbeatRuns.companyId, issue.companyId),
+                eq(heartbeatRuns.id, runId),
+                eq(heartbeatRuns.agentId, agentId),
+                sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${delivery.actionId}`,
+                sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${delivery.sourceRunId}`,
+              ));
+            const [recorded] = await tx
+              .update(issueRecoveryActions)
+              .set({
+                evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+                  continuationDelivery: "delivered",
+                  continuationRunId: runId,
+                })}::jsonb`,
+              })
+              .where(and(
+                eq(issueRecoveryActions.companyId, issue.companyId),
+                eq(issueRecoveryActions.id, delivery.actionId),
+                eq(issueRecoveryActions.status, "resolved"),
+                sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+                sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(delivery.decision)}::jsonb`,
+              ))
+              .returning({ id: issueRecoveryActions.id });
+            if (!recorded) throw new Error("reconciled_delivery_changed");
+            if (!delivery.adoptedWakeId) return;
+            const [adopted] = await tx
+              .update(agentWakeupRequests)
+              .set({ runId, updatedAt: new Date() })
+              .where(and(
+                eq(agentWakeupRequests.id, delivery.adoptedWakeId),
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.status, "coalesced"),
+                isNull(agentWakeupRequests.runId),
+              ))
+              .returning({ id: agentWakeupRequests.id });
+            if (!adopted) throw new Error("adopted_deferred_wake_changed");
+          };
           if (executionReconciliationWake) {
             const actionId = readNonEmptyString(
               enrichedContextSnapshot.recoveryActionId,
@@ -27262,6 +27311,23 @@ export function heartbeatService(
             const decision = parseObject(
               action?.evidence.executionReconciliation,
             );
+            const expectedAdoptedDeferredWake =
+              enrichedContextSnapshot.reconciliationAdoptedDeferredWake ?? null;
+            const recordedAdoptedDeferredWake =
+              action?.evidence.adoptedDeferredWake ?? null;
+            const expectedAdoption = parseObject(expectedAdoptedDeferredWake);
+            const adoptionMatches = (() => {
+              if (expectedAdoptedDeferredWake === null && recordedAdoptedDeferredWake === null) return true;
+              const expected = parseObject(expectedAdoptedDeferredWake);
+              const recorded = parseObject(recordedAdoptedDeferredWake);
+              const expectedIds = Array.isArray(expected.commentIds) ? expected.commentIds : [];
+              const recordedIds = Array.isArray(recorded.commentIds) ? recorded.commentIds : [];
+              return typeof expected.wakeId === "string" &&
+                expected.wakeId === recorded.wakeId &&
+                expectedIds.length > 0 &&
+                expectedIds.length === recordedIds.length &&
+                expectedIds.every((id, index) => typeof id === "string" && id === recordedIds[index]);
+            })();
             const sourceRunId = readNonEmptyString(decision.runId);
             if (
               !action ||
@@ -27275,6 +27341,7 @@ export function heartbeatService(
                 String(decision.actionOutcome),
               ) ||
               !readNonEmptyString(decision.outcomeEvidence) ||
+              !adoptionMatches ||
               enrichedContextSnapshot.previousRunId !== sourceRunId ||
               enrichedContextSnapshot.retryOfRunId !== sourceRunId ||
               !["pending", "delivered"].includes(
@@ -27322,11 +27389,35 @@ export function heartbeatService(
                 existingRun.contextSnapshot?.previousRunId !== sourceRunId
               )
                 return { kind: "deferred" as const };
+              if (
+                action.evidence.continuationDelivery === "delivered" &&
+                action.evidence.continuationRunId !== existingRun.id
+              )
+                return { kind: "deferred" as const };
+              if (action.evidence.continuationDelivery === "pending") {
+                reconciliationDelivery = {
+                  actionId: action.id,
+                  sourceRunId,
+                  decision,
+                  adoptedWakeId: typeof expectedAdoption.wakeId === "string"
+                    ? expectedAdoption.wakeId
+                    : null,
+                };
+                await recordReconciliationDelivery(existingRun.id);
+              }
               return { kind: "replayed" as const, run: existingRun };
             }
             if (action.evidence.continuationDelivery !== "pending")
               return { kind: "skipped" as const };
             reconciledSourceRunId = sourceRunId;
+            reconciliationDelivery = {
+              actionId: action.id,
+              sourceRunId,
+              decision,
+              adoptedWakeId: typeof expectedAdoption.wakeId === "string"
+                ? expectedAdoption.wakeId
+                : null,
+            };
           }
 
           let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
@@ -28295,6 +28386,8 @@ export function heartbeatService(
               updatedAt: new Date(),
             })
             .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+          await recordReconciliationDelivery(newRun.id);
 
           if (adoptedComments.length) {
             await tx
