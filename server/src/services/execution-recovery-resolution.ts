@@ -3,11 +3,13 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
+  agentWakeupRequests,
   chatActions,
   environmentLeases,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
   issues,
   nativeRunFinalizations,
@@ -15,6 +17,11 @@ import {
 } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
+import {
+  queuedCommentIdsFromWakePayload,
+  withQueuedCommentIdsInRunContext,
+  withQueuedCommentIdsInWakePayload,
+} from "./issue-queued-comment-queue.js";
 import {
   EXECUTION_RECONCILIATION_CAUSES,
   type ExecutionReconciliation,
@@ -65,6 +72,34 @@ function sourceAuthorityMatches(task: typeof issues.$inferSelect, binding: Sourc
     binding.reviewStageId === (review?.currentStageId ?? null) &&
     binding.reviewParticipantAgentId === (participant?.type === "agent" ? participant.agentId : null) &&
     binding.reviewParticipantUserId === (participant?.type === "user" ? participant.userId : null);
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function matchingNotPerformedReconciliation(
+  value: unknown,
+  decision: ExecutionReconciliation,
+) {
+  const candidate = record(value);
+  return decision.providerStopped === true &&
+    decision.actionOutcome === "not_performed" &&
+    candidate.runId === decision.runId &&
+    candidate.providerStopped === true &&
+    candidate.actionOutcome === "not_performed" &&
+    candidate.outcomeEvidence === decision.outcomeEvidence;
+}
+
+function adoptedDeferredWake(evidence: Record<string, unknown>) {
+  const adoption = record(evidence.adoptedDeferredWake);
+  const wakeId = typeof adoption.wakeId === "string" ? adoption.wakeId : null;
+  const commentIds = Array.isArray(adoption.commentIds)
+    ? adoption.commentIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+    : [];
+  return wakeId && commentIds.length ? { wakeId, commentIds } : null;
 }
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
@@ -236,7 +271,195 @@ export async function markExecutionReconciliation(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
       ),
-    );
+  );
+}
+
+/**
+ * Fold an older no-replay hold into the one already-authorized continuation.
+ * This is deliberately narrower than ordinary reconciliation: it reserves the
+ * exact saved user comment before the old hold stops blocking queue promotion.
+ */
+export async function coalesceStaleExecutionReconciliation(
+  db: Db,
+  action: typeof issueRecoveryActions.$inferSelect,
+  task: typeof issues.$inferSelect,
+  decision: ExecutionReconciliation,
+) {
+  const automatic = record(action.evidence.automaticRecovery);
+  if (automatic.replay !== "blocked") return false;
+
+  const actions = await db
+    .select()
+    .from(issueRecoveryActions)
+    .where(and(
+      eq(issueRecoveryActions.companyId, action.companyId),
+      eq(issueRecoveryActions.sourceIssueId, action.sourceIssueId),
+    ))
+    .orderBy(asc(issueRecoveryActions.id))
+    .for("update");
+  const stale = actions.find((candidate) => candidate.id === action.id);
+  if (
+    !stale ||
+    stale.status !== "active" ||
+    record(stale.evidence.automaticRecovery).replay !== "blocked" ||
+    stale.evidence.runId !== decision.runId
+  ) {
+    throw conflict("The historical recovery hold changed. Inspect the current recovery records before continuing.");
+  }
+
+  const siblings = actions.filter((candidate) =>
+    candidate.id !== stale.id &&
+    candidate.kind === stale.kind &&
+    candidate.cause === stale.cause &&
+    candidate.fingerprint === stale.fingerprint &&
+    candidate.returnOwnerAgentId === stale.returnOwnerAgentId &&
+    candidate.evidence.runId === decision.runId,
+  );
+  if (!siblings.length) return false;
+  if (siblings.length !== 1) {
+    throw conflict("Multiple matching recovery continuations remain. Inspect them before continuing.");
+  }
+  const canonical = siblings[0]!;
+  const canonicalBinding = sourceAuthorityBinding(canonical.evidence);
+  const staleBinding = sourceAuthorityBinding(stale.evidence);
+  if (
+    canonical.status !== "resolved" ||
+    canonical.evidence.continuationDelivery !== "pending" ||
+    adoptedDeferredWake(canonical.evidence) !== null ||
+    !matchingNotPerformedReconciliation(canonical.evidence.executionReconciliation, decision) ||
+    !canonical.returnOwnerAgentId ||
+    task.assigneeAgentId !== canonical.returnOwnerAgentId ||
+    task.executionRunId !== null ||
+    task.checkoutRunId !== null ||
+    ["done", "cancelled"].includes(task.status) ||
+    (canonicalBinding !== null && !sourceAuthorityMatches(task, canonicalBinding)) ||
+    (staleBinding !== null && !sourceAuthorityMatches(task, staleBinding))
+  ) {
+    throw conflict("The current task authority no longer matches the recorded continuation.");
+  }
+
+  const liveWakes = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(and(
+      eq(agentWakeupRequests.companyId, task.companyId),
+      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`,
+    ))
+    .orderBy(asc(agentWakeupRequests.id))
+    .for("update");
+  if (liveWakes.length !== 1 || liveWakes[0]!.agentId !== canonical.returnOwnerAgentId) {
+    throw conflict("Another live wake exists for this task. Preserve the existing delivery before resolving the historical hold.");
+  }
+  const deferred = liveWakes[0]!;
+  const deferredPayload = record(deferred.payload);
+  const deferredContext = record(deferredPayload._paperclipWakeContext);
+  const commentIds = queuedCommentIdsFromWakePayload(deferred.payload);
+  if (
+    deferred.status !== "deferred_issue_execution" ||
+    deferred.requestedByActorType !== "user" ||
+    !deferred.requestedByActorId ||
+    deferred.idempotencyKey !== null ||
+    !["issue_commented", "issue_reopened_via_comment"].includes(
+      String(deferredContext.wakeReason ?? deferred.reason),
+    ) ||
+    deferredPayload.queuedCommentInterrupt ||
+    deferredPayload.interactionId ||
+    deferredContext.interactionId ||
+    deferredContext.explicitNativeContinuation ||
+    commentIds.length !== 1
+  ) {
+    throw conflict("The saved wake is no longer the exact user-comment continuation to adopt.");
+  }
+  const comments = await db
+    .select({
+      id: issueComments.id,
+      authorUserId: issueComments.authorUserId,
+      authorType: issueComments.authorType,
+      authorAgentId: issueComments.authorAgentId,
+      onBehalfOfUserId: issueComments.onBehalfOfUserId,
+      createdByRunId: issueComments.createdByRunId,
+      derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
+      derivedCreatedByRunId: issueComments.derivedCreatedByRunId,
+      derivedAuthorSource: issueComments.derivedAuthorSource,
+      deletedAt: issueComments.deletedAt,
+    })
+    .from(issueComments)
+    .where(and(
+      eq(issueComments.companyId, task.companyId),
+      eq(issueComments.issueId, task.id),
+      inArray(issueComments.id, commentIds),
+    ));
+  if (
+    comments.length !== commentIds.length ||
+    comments.some((comment) =>
+      comment.deletedAt ||
+      comment.authorType !== "user" ||
+      comment.authorAgentId !== null ||
+      comment.onBehalfOfUserId !== null ||
+      comment.createdByRunId !== null ||
+      comment.derivedAuthorAgentId !== null ||
+      comment.derivedCreatedByRunId !== null ||
+      comment.derivedAuthorSource !== null ||
+      comment.authorUserId !== deferred.requestedByActorId,
+    )
+  ) {
+    throw conflict("The saved comment no longer matches its original user authority.");
+  }
+
+  const [reserved] = await db
+    .update(agentWakeupRequests)
+    .set({ status: "coalesced", updatedAt: new Date() })
+    .where(and(
+      eq(agentWakeupRequests.id, deferred.id),
+      eq(agentWakeupRequests.companyId, task.companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      isNull(agentWakeupRequests.runId),
+    ))
+    .returning({ id: agentWakeupRequests.id });
+  if (!reserved) throw conflict("The saved wake changed before it could be reserved.");
+
+  const [updatedCanonical] = await db
+    .update(issueRecoveryActions)
+    .set({ evidence: {
+      ...canonical.evidence,
+      adoptedDeferredWake: { wakeId: deferred.id, commentIds },
+    } })
+    .where(and(
+      eq(issueRecoveryActions.id, canonical.id),
+      eq(issueRecoveryActions.companyId, canonical.companyId),
+      eq(issueRecoveryActions.status, "resolved"),
+      sql`${issueRecoveryActions.evidence} = ${JSON.stringify(canonical.evidence)}::jsonb`,
+    ))
+    .returning({ id: issueRecoveryActions.id });
+  if (!updatedCanonical) throw conflict("The canonical continuation changed before the saved comment could be adopted.");
+
+  const { automaticRecovery: _automaticRecovery, ...staleEvidence } = stale.evidence;
+  const [updatedStale] = await db
+    .update(issueRecoveryActions)
+    .set({ evidence: {
+      ...staleEvidence,
+      continuationDelivery: "coalesced",
+      coalescedIntoRecoveryActionId: canonical.id,
+    } })
+    .where(and(
+      eq(issueRecoveryActions.id, stale.id),
+      eq(issueRecoveryActions.companyId, stale.companyId),
+      eq(issueRecoveryActions.status, "active"),
+      sql`${issueRecoveryActions.evidence} = ${JSON.stringify(stale.evidence)}::jsonb`,
+    ))
+    .returning({ id: issueRecoveryActions.id });
+  if (!updatedStale) throw conflict("The historical hold changed before it could be coalesced.");
+  await persistActivity(db, {
+    companyId: task.companyId,
+    actorType: "system",
+    actorId: "execution-recovery",
+    action: "issue.execution_recovery_coalesced",
+    entityType: "issue",
+    entityId: task.id,
+    details: { recoveryActionId: stale.id, canonicalRecoveryActionId: canonical.id, deferredWakeId: deferred.id },
+  });
+  return true;
 }
 
 export async function deliverReconciledExecutions(
@@ -258,6 +481,7 @@ export async function deliverReconciledExecutions(
       const decision = action.evidence.executionReconciliation as
         ExecutionReconciliation | undefined;
       if (!decision || !action.returnOwnerAgentId) continue;
+      const adoption = adoptedDeferredWake(action.evidence);
       const pendingDecision = and(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
@@ -287,24 +511,35 @@ export async function deliverReconciledExecutions(
           .where(pendingDecision);
         continue;
       }
+      const wakePayload = adoption
+        ? withQueuedCommentIdsInWakePayload(
+            { issueId: task.id, recoveryActionId: action.id },
+            adoption.commentIds,
+          )
+        : { issueId: task.id, recoveryActionId: action.id };
+      const wakeContextBase = {
+        issueId: task.id,
+        taskId: task.id,
+        recoveryActionId: action.id,
+        previousRunId: decision.runId,
+        retryOfRunId: decision.runId,
+        forceFreshSession: true,
+        reconciliationAdoptedDeferredWake: action.evidence.adoptedDeferredWake ?? null,
+        wakeReason: "issue_recovery_action_restored",
+        source: "execution.reconciled",
+      };
+      const wakeContext = adoption
+        ? withQueuedCommentIdsInRunContext(wakeContextBase, adoption.commentIds)
+        : wakeContextBase;
       const run = await wake(action.returnOwnerAgentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_recovery_action_restored",
         idempotencyKey: `execution-reconciliation:${action.id}`,
-        payload: { issueId: task.id, recoveryActionId: action.id },
+        payload: wakePayload,
         requestedByActorType: "system",
         requestedByActorId: "execution-recovery",
-        contextSnapshot: {
-          issueId: task.id,
-          taskId: task.id,
-          recoveryActionId: action.id,
-          previousRunId: decision.runId,
-          retryOfRunId: decision.runId,
-          forceFreshSession: true,
-          wakeReason: "issue_recovery_action_restored",
-          source: "execution.reconciled",
-        },
+        contextSnapshot: wakeContext,
       });
       if (run)
         await db.transaction(async (tx) => {
@@ -331,6 +566,19 @@ export async function deliverReconciledExecutions(
               )}::jsonb`,
             })
             .where(pendingDecision);
+          if (adoption) {
+            const [adopted] = await tx
+              .update(agentWakeupRequests)
+              .set({ runId: run.id, updatedAt: new Date() })
+              .where(and(
+                eq(agentWakeupRequests.id, adoption.wakeId),
+                eq(agentWakeupRequests.companyId, action.companyId),
+                eq(agentWakeupRequests.status, "coalesced"),
+                isNull(agentWakeupRequests.runId),
+              ))
+              .returning({ id: agentWakeupRequests.id });
+            if (!adopted) throw new Error("adopted_deferred_wake_changed");
+          }
         });
     } catch {
       logger.warn(

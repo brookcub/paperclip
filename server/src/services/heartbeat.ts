@@ -27175,6 +27175,22 @@ export function heartbeatService(
             const decision = parseObject(
               action?.evidence.executionReconciliation,
             );
+            const expectedAdoptedDeferredWake =
+              enrichedContextSnapshot.reconciliationAdoptedDeferredWake ?? null;
+            const recordedAdoptedDeferredWake =
+              action?.evidence.adoptedDeferredWake ?? null;
+            const adoptionMatches = (() => {
+              if (expectedAdoptedDeferredWake === null && recordedAdoptedDeferredWake === null) return true;
+              const expected = parseObject(expectedAdoptedDeferredWake);
+              const recorded = parseObject(recordedAdoptedDeferredWake);
+              const expectedIds = Array.isArray(expected.commentIds) ? expected.commentIds : [];
+              const recordedIds = Array.isArray(recorded.commentIds) ? recorded.commentIds : [];
+              return typeof expected.wakeId === "string" &&
+                expected.wakeId === recorded.wakeId &&
+                expectedIds.length > 0 &&
+                expectedIds.length === recordedIds.length &&
+                expectedIds.every((id, index) => typeof id === "string" && id === recordedIds[index]);
+            })();
             const sourceRunId = readNonEmptyString(decision.runId);
             if (
               !action ||
@@ -27188,6 +27204,7 @@ export function heartbeatService(
                 String(decision.actionOutcome),
               ) ||
               !readNonEmptyString(decision.outcomeEvidence) ||
+              !adoptionMatches ||
               enrichedContextSnapshot.previousRunId !== sourceRunId ||
               enrichedContextSnapshot.retryOfRunId !== sourceRunId ||
               !["pending", "delivered"].includes(
