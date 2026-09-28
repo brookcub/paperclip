@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
@@ -6,6 +7,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { boundHeartbeatRunEventPayloadForStorage, heartbeatService } from "../services/heartbeat.ts";
+import { buildRunCompletionEvidence } from "../services/run-completion-evidence.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -279,6 +281,127 @@ describeEmbeddedPostgres("heartbeat list", () => {
     expect(typeof result?.stdout).toBe("string");
     expect((result?.stdout as string).length).toBeLessThan(oversizedStdout.length);
     expect(result).not.toHaveProperty("nestedHuge");
+  });
+
+  it("retains bounded completion evidence privately when unrelated result output exceeds the public display cap", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    // This is the observed native Codex completion-evidence shape: structured
+    // metadata only, with no stdout, prompt, or raw rollout retained.
+    const nativeCodexCompletionEvidence = {
+      schema: "paperclip.codex-rollout-completion-evidence.v1",
+      status: "partial",
+      source: "codex_rollout_session",
+      sessionId: "019cabcd-1234-7abc-8def-0123456789ab",
+      toolSchemaCoverage: "dynamic_tools_only_partial",
+      rollout: {
+        fileName: "rollout-2026-09-27T00-00-00-019cabcd-1234-7abc-8def-0123456789ab.jsonl",
+        sha256: "b".repeat(64),
+        bytes: 42,
+        sessionBinding: "session_meta.payload.session_id",
+        fieldProvenance: {
+          model: "turn_context",
+          effort: "turn_context",
+          dynamicTools: "session_meta",
+        },
+        models: ["gpt-6-sol"],
+        effort: ["high"],
+        effortStatus: "available",
+        dynamicToolSchemaStatus: "available",
+        dynamicTools: [{
+          name: "mcp__company__read_issue",
+          inputSchemaShape: {
+            type: ["object"],
+            required: ["issueId"],
+            properties: ["issueId"],
+            hasItems: false,
+            variants: [],
+            additionalProperties: false,
+            enumCount: null,
+          },
+          inputSchemaShapeSha256: "a".repeat(64),
+        }],
+        malformedRecordCount: 0,
+      },
+      parseGaps: ["builtin_tool_schema_not_in_rollout_dynamic_tools"],
+    };
+    const oversizedStdout = Array.from({ length: 8_000 }, (_, index) =>
+      `${index.toString(16).padStart(4, "0")}-${randomUUID()}`,
+    ).join("|");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      resultJson: {
+        summary: "completed",
+        stdout: oversizedStdout,
+        completionEvidence: nativeCodexCompletionEvidence,
+      },
+    });
+
+    const service = heartbeatService(db);
+    const publicRun = await service.getRun(runId);
+    const privateEvidence = await service.getRunCompletionEvidenceResultJson(runId);
+
+    expect(publicRun?.resultJson).toMatchObject({
+      truncated: true,
+      truncationReason: "oversized_result_json",
+    });
+    expect(publicRun?.resultJson).not.toHaveProperty("completionEvidence");
+    expect(privateEvidence).toEqual({
+      resultJson: { completionEvidence: nativeCodexCompletionEvidence },
+      unavailableReason: null,
+    });
+    const completionEvent = buildRunCompletionEvidence({
+      runId,
+      adapterType: "codex_local",
+      adapterResultJson: privateEvidence?.resultJson ?? null,
+      providerTrace: null,
+      providerTraceRequested: false,
+    });
+    expect(completionEvent.transcript).toMatchObject({
+      schema: "paperclip.codex-rollout-completion-evidence.v1",
+      status: "partial",
+      rollout: {
+        effort: ["high"],
+        dynamicToolSchemaStatus: "available",
+      },
+    });
+    expect(JSON.stringify(completionEvent)).not.toContain(oversizedStdout);
+    await db.update(heartbeatRuns).set({
+      resultJson: {
+        // JSON text length, not the compressed database representation, guards
+        // the private materialization limit.
+        completionEvidence: { retained: "x".repeat(8 * 1024 * 1024 + 1) },
+      },
+    }).where(eq(heartbeatRuns.id, runId));
+    const oversizedPrivateEvidence = await service
+      .getRunCompletionEvidenceResultJson(runId);
+    expect(oversizedPrivateEvidence).toEqual({
+      resultJson: null,
+      unavailableReason: "completion_evidence_exceeds_private_projection_limit",
+    });
   });
 });
 
