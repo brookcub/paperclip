@@ -3,7 +3,7 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, asc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
   chatActions,
@@ -28,56 +28,16 @@ import {
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import {
+  projectSourceAuthority,
+  readSourceAuthorityBinding,
+  sourceAuthorityMatches,
+} from "./source-authority-binding.js";
 
 type RecoveryActionCoalescingInput = Pick<
   typeof issueRecoveryActions.$inferSelect,
   "companyId" | "evidence" | "id" | "sourceIssueId"
 >;
-
-type SourceAuthorityBinding = {
-  status: string;
-  statusVersion: number;
-  lastStatusDecisionId: string | null;
-  assigneeAgentId: string | null;
-  assigneeUserId: string | null;
-  executionRunId: string | null;
-  checkoutRunId: string | null;
-  hiddenAt: string | null;
-  reviewStageId: string | null;
-  reviewParticipantAgentId: string | null;
-  reviewParticipantUserId: string | null;
-};
-
-function sourceAuthorityBinding(evidence: Record<string, unknown>): SourceAuthorityBinding | null {
-  const value = evidence.sourceAuthorityBinding;
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const binding = value as Record<string, unknown>;
-  const nullableString = (key: keyof SourceAuthorityBinding) =>
-    binding[key] === null || typeof binding[key] === "string" ? binding[key] : undefined;
-  const fields: (keyof SourceAuthorityBinding)[] = [
-    "lastStatusDecisionId", "assigneeAgentId", "assigneeUserId", "executionRunId",
-    "checkoutRunId", "hiddenAt", "reviewStageId", "reviewParticipantAgentId", "reviewParticipantUserId",
-  ];
-  if (typeof binding.status !== "string" || typeof binding.statusVersion !== "number" ||
-      fields.some((key) => nullableString(key) === undefined)) return null;
-  return binding as SourceAuthorityBinding;
-}
-
-function sourceAuthorityMatches(task: typeof issues.$inferSelect, binding: SourceAuthorityBinding) {
-  const review = task.status === "in_review" ? parseIssueExecutionState(task.executionState) : null;
-  const participant = review?.currentParticipant;
-  return binding.status === task.status &&
-    binding.statusVersion === task.statusVersion &&
-    binding.lastStatusDecisionId === task.lastStatusDecisionId &&
-    binding.assigneeAgentId === task.assigneeAgentId &&
-    binding.assigneeUserId === task.assigneeUserId &&
-    binding.executionRunId === task.executionRunId &&
-    binding.checkoutRunId === task.checkoutRunId &&
-    binding.hiddenAt === (task.hiddenAt?.toISOString() ?? null) &&
-    binding.reviewStageId === (review?.currentStageId ?? null) &&
-    binding.reviewParticipantAgentId === (participant?.type === "agent" ? participant.agentId : null) &&
-    binding.reviewParticipantUserId === (participant?.type === "user" ? participant.userId : null);
-}
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -325,8 +285,8 @@ export async function coalesceStaleExecutionReconciliation(
     throw conflict("Multiple matching recovery continuations remain. Inspect them before continuing.");
   }
   const canonical = siblings[0]!;
-  const canonicalBinding = sourceAuthorityBinding(canonical.evidence);
-  const staleBinding = sourceAuthorityBinding(stale.evidence);
+  const canonicalBinding = readSourceAuthorityBinding(canonical.evidence.sourceAuthorityBinding);
+  const staleBinding = readSourceAuthorityBinding(stale.evidence.sourceAuthorityBinding);
   if (
     canonical.status !== "resolved" ||
     canonical.evidence.continuationDelivery !== "pending" ||
@@ -594,6 +554,109 @@ export async function deliverReconciledExecutions(
   }
 }
 
+/** Retire only holds whose own recorded blocked projection was later superseded. */
+async function supersedeEffectiveResolvedHolds(db: Db, now: Date) {
+  let afterId: string | null = null;
+  for (;;) {
+    const predicates = [
+      not(conversationRecoveryActionPredicate()!),
+      eq(issueRecoveryActions.status, "resolved"),
+      eq(issueRecoveryActions.kind, "active_run_watchdog"),
+      inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      sql`${issueRecoveryActions.evidence} ? 'settledAuthorityProjection'`,
+    ];
+    if (afterId) predicates.push(gt(issueRecoveryActions.id, afterId));
+    const candidates = await db
+      .select({
+        id: issueRecoveryActions.id,
+        companyId: issueRecoveryActions.companyId,
+        sourceIssueId: issueRecoveryActions.sourceIssueId,
+      })
+      .from(issueRecoveryActions)
+      .where(and(...predicates))
+      .orderBy(asc(issueRecoveryActions.id))
+      .limit(25);
+    if (!candidates.length) return;
+    afterId = candidates[candidates.length - 1]!.id;
+    for (const candidate of candidates) {
+      try {
+      await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+        );
+        const [task] = await tx
+          .select()
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, candidate.companyId),
+            eq(issues.id, candidate.sourceIssueId),
+          ))
+          .for("update");
+        const [action] = await tx
+          .select()
+          .from(issueRecoveryActions)
+          .where(and(
+            eq(issueRecoveryActions.companyId, candidate.companyId),
+            eq(issueRecoveryActions.id, candidate.id),
+          ))
+          .for("update");
+        if (
+          !task ||
+          !action ||
+          action.sourceIssueId !== candidate.sourceIssueId ||
+          action.status !== "resolved" ||
+          record(action.evidence.automaticRecovery).replay !== "blocked"
+        ) return;
+        const projection = readSourceAuthorityBinding(
+          action.evidence.settledAuthorityProjection,
+        );
+        // Old or malformed records do not establish which blocked projection this
+        // recovery owned, so retain their conservative no-replay hold.
+        if (!projection || sourceAuthorityMatches(task, projection)) return;
+        const automatic = record(action.evidence.automaticRecovery);
+        await tx
+          .update(issueRecoveryActions)
+          .set({
+            nextAction: "Recovery hold superseded by a later task decision. Recorded work remains preserved and was not replayed.",
+            resolutionNote: "A later material task decision superseded this recovery hold; unknown external outcomes remain preserved.",
+            updatedAt: now,
+            evidence: {
+              ...action.evidence,
+              automaticRecovery: {
+                ...automatic,
+                policy: "source_authority_changed_v1",
+                replay: "superseded",
+                recordedAt: now.toISOString(),
+              },
+            },
+          })
+          .where(and(
+            eq(issueRecoveryActions.companyId, action.companyId),
+            eq(issueRecoveryActions.id, action.id),
+            eq(issueRecoveryActions.status, "resolved"),
+            sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+          ));
+        await persistActivity(tx as unknown as Db, {
+          companyId: action.companyId,
+          actorType: "system",
+          actorId: "execution-recovery",
+          action: "issue.execution_recovery_superseded",
+          entityType: "issue",
+          entityId: action.sourceIssueId,
+          details: { recoveryActionId: action.id, replay: "superseded" },
+        });
+      });
+      } catch (err) {
+        logger.warn(
+          { err, recoveryActionId: candidate.id },
+          "Effective execution recovery hold remains pending for a later sweep",
+        );
+      }
+    }
+  }
+}
+
 /**
  * Failed execution is a system responsibility, not a user questionnaire. After
  * automatic recovery is ruled out, preserve evidence and stop without replay.
@@ -761,7 +824,7 @@ export async function settleUnrecoverableExecutions(
             !coordinator.failureDetail?.replacementDenied)
         )
           return;
-        const binding = sourceAuthorityBinding(action.evidence);
+        const binding = readSourceAuthorityBinding(action.evidence.sourceAuthorityBinding);
         const sourceAuthorityChanged = binding !== null && !sourceAuthorityMatches(task, binding);
         const current =
           !sourceAuthorityChanged &&
@@ -775,6 +838,7 @@ export async function settleUnrecoverableExecutions(
           ? "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated."
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
+        let settledAuthorityProjection = null;
         if (current) {
           const [projected] = await tx
             .update(issues)
@@ -787,8 +851,14 @@ export async function settleUnrecoverableExecutions(
             .where(eq(issues.id, task.id)).returning();
           // Only a transition owned by this failure grants a recovery receipt.
           // An already-blocked task may have a separate human/dependency hold.
-          if (task.status !== "blocked" && run.runtimeMode === "native") {
-            nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
+          if (task.status !== "blocked") {
+            // This is the only blocked projection the recovery owns. A later
+            // effective-hold scan compares against this post-update row rather
+            // than mistaking this settlement write for a Board decision.
+            settledAuthorityProjection = projectSourceAuthority(projected!);
+            if (run.runtimeMode === "native") {
+              nativeFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion };
+            }
           }
         }
         await tx
@@ -805,12 +875,13 @@ export async function settleUnrecoverableExecutions(
             evidence: {
               ...action.evidence,
               ...(nativeFailureBlock ? { nativeFailureBlock } : {}),
+              ...(settledAuthorityProjection ? { settledAuthorityProjection } : {}),
               automaticRecovery: sourceAuthorityChanged
                 ? {
+                    ...record(action.evidence.automaticRecovery),
                     policy: "source_authority_changed_v1",
                     runId: run.id,
                     replay: "superseded",
-                    actionOutcome: "superseded",
                     recordedAt: now.toISOString(),
                   }
                 : {
@@ -866,4 +937,5 @@ export async function settleUnrecoverableExecutions(
       );
     }
   }
+  await supersedeEffectiveResolvedHolds(db, now);
 }
