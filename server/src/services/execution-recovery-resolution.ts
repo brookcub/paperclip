@@ -29,6 +29,11 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 
+type RecoveryActionCoalescingInput = Pick<
+  typeof issueRecoveryActions.$inferSelect,
+  "companyId" | "evidence" | "id" | "sourceIssueId"
+>;
+
 type SourceAuthorityBinding = {
   status: string;
   statusVersion: number;
@@ -281,7 +286,7 @@ export async function markExecutionReconciliation(
  */
 export async function coalesceStaleExecutionReconciliation(
   db: Db,
-  action: typeof issueRecoveryActions.$inferSelect,
+  action: RecoveryActionCoalescingInput,
   task: typeof issues.$inferSelect,
   decision: ExecutionReconciliation,
 ) {
