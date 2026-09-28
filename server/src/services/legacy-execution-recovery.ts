@@ -11,6 +11,24 @@ import { isSupersededConversationRun } from "./agent-conversations.js";
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+function sourceAuthorityBinding(task: typeof issues.$inferSelect, runId: string) {
+  const review = task.status === "in_review" ? parseIssueExecutionState(task.executionState) : null;
+  const participant = review?.currentParticipant;
+  return {
+    status: task.status,
+    statusVersion: task.statusVersion,
+    lastStatusDecisionId: task.lastStatusDecisionId,
+    assigneeAgentId: task.assigneeAgentId,
+    assigneeUserId: task.assigneeUserId,
+    executionRunId: task.executionRunId === runId ? null : task.executionRunId,
+    checkoutRunId: task.checkoutRunId === runId ? null : task.checkoutRunId,
+    hiddenAt: task.hiddenAt?.toISOString() ?? null,
+    reviewStageId: review?.currentStageId ?? null,
+    reviewParticipantAgentId: participant?.type === "agent" ? participant.agentId : null,
+    reviewParticipantUserId: participant?.type === "user" ? participant.userId : null,
+  };
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
@@ -112,14 +130,15 @@ export async function terminalizeLegacyExecution(input: {
     ) {
       // Periodic stranded-work checks may revisit this terminal run before its
       // reconciled continuation is dispatched. Preserve the recorded decision.
-      const [reconciled] = await tx.select({ id: issueRecoveryActions.id })
+      const [recorded] = await tx.select({ id: issueRecoveryActions.id })
         .from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId),
           eq(issueRecoveryActions.sourceIssueId, task.id),
-          eq(issueRecoveryActions.status, "resolved"),
-          sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+          eq(issueRecoveryActions.kind, "active_run_watchdog"),
+          eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+          sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
         )).limit(1);
-      if (reconciled) return updated;
+      if (recorded) return updated;
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
         sourceIssueId: task.id,
@@ -130,6 +149,7 @@ export async function terminalizeLegacyExecution(input: {
         fingerprint: `legacy-execution:${run.id}`,
         evidence: {
           runId: run.id,
+          sourceAuthorityBinding: sourceAuthorityBinding(task, run.id),
           ...(isCurrentReviewer ? { reviewParticipantAgentId: run.agentId } : {}),
           originalFailureCode: updated.errorCode,
           adapterRecovery: "unsupported_or_unknown",

@@ -22,6 +22,51 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 
+type SourceAuthorityBinding = {
+  status: string;
+  statusVersion: number;
+  lastStatusDecisionId: string | null;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  executionRunId: string | null;
+  checkoutRunId: string | null;
+  hiddenAt: string | null;
+  reviewStageId: string | null;
+  reviewParticipantAgentId: string | null;
+  reviewParticipantUserId: string | null;
+};
+
+function sourceAuthorityBinding(evidence: Record<string, unknown>): SourceAuthorityBinding | null {
+  const value = evidence.sourceAuthorityBinding;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const binding = value as Record<string, unknown>;
+  const nullableString = (key: keyof SourceAuthorityBinding) =>
+    binding[key] === null || typeof binding[key] === "string" ? binding[key] : undefined;
+  const fields: (keyof SourceAuthorityBinding)[] = [
+    "lastStatusDecisionId", "assigneeAgentId", "assigneeUserId", "executionRunId",
+    "checkoutRunId", "hiddenAt", "reviewStageId", "reviewParticipantAgentId", "reviewParticipantUserId",
+  ];
+  if (typeof binding.status !== "string" || typeof binding.statusVersion !== "number" ||
+      fields.some((key) => nullableString(key) === undefined)) return null;
+  return binding as SourceAuthorityBinding;
+}
+
+function sourceAuthorityMatches(task: typeof issues.$inferSelect, binding: SourceAuthorityBinding) {
+  const review = task.status === "in_review" ? parseIssueExecutionState(task.executionState) : null;
+  const participant = review?.currentParticipant;
+  return binding.status === task.status &&
+    binding.statusVersion === task.statusVersion &&
+    binding.lastStatusDecisionId === task.lastStatusDecisionId &&
+    binding.assigneeAgentId === task.assigneeAgentId &&
+    binding.assigneeUserId === task.assigneeUserId &&
+    binding.executionRunId === task.executionRunId &&
+    binding.checkoutRunId === task.checkoutRunId &&
+    binding.hiddenAt === (task.hiddenAt?.toISOString() ?? null) &&
+    binding.reviewStageId === (review?.currentStageId ?? null) &&
+    binding.reviewParticipantAgentId === (participant?.type === "agent" ? participant.agentId : null) &&
+    binding.reviewParticipantUserId === (participant?.type === "user" ? participant.userId : null);
+}
+
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
   db: Db;
@@ -463,7 +508,10 @@ export async function settleUnrecoverableExecutions(
             !coordinator.failureDetail?.replacementDenied)
         )
           return;
+        const binding = sourceAuthorityBinding(action.evidence);
+        const sourceAuthorityChanged = binding !== null && !sourceAuthorityMatches(task, binding);
         const current =
+          !sourceAuthorityChanged &&
           !isSupersededConversationRun(task, run) &&
           action.returnOwnerAgentId !== null &&
           task.assigneeAgentId === action.returnOwnerAgentId &&
@@ -504,13 +552,21 @@ export async function settleUnrecoverableExecutions(
             evidence: {
               ...action.evidence,
               ...(nativeFailureBlock ? { nativeFailureBlock } : {}),
-              automaticRecovery: {
-                policy: "preserve_without_replay_v1",
-                runId: run.id,
-                replay: "blocked",
-                actionOutcome: "unknown",
-                recordedAt: now.toISOString(),
-              },
+              automaticRecovery: sourceAuthorityChanged
+                ? {
+                    policy: "source_authority_changed_v1",
+                    runId: run.id,
+                    replay: "superseded",
+                    actionOutcome: "superseded",
+                    recordedAt: now.toISOString(),
+                  }
+                : {
+                    policy: "preserve_without_replay_v1",
+                    runId: run.id,
+                    replay: "blocked",
+                    actionOutcome: "unknown",
+                    recordedAt: now.toISOString(),
+                  },
             },
           })
           .where(eq(issueRecoveryActions.id, action.id));
@@ -525,7 +581,7 @@ export async function settleUnrecoverableExecutions(
           details: {
             recoveryActionId: action.id,
             outcome: current ? "blocked" : "cancelled",
-            replay: "not_authorized",
+            replay: sourceAuthorityChanged ? "superseded" : "not_authorized",
           },
         });
         await tx
@@ -543,8 +599,8 @@ export async function settleUnrecoverableExecutions(
           payload: {
             recoveryActionId: action.id,
             cause: action.cause,
-            automaticRecovery: "preserve_without_replay_v1",
-            replay: "blocked",
+            automaticRecovery: sourceAuthorityChanged ? "source_authority_changed_v1" : "preserve_without_replay_v1",
+            replay: sourceAuthorityChanged ? "superseded" : "blocked",
           },
         });
         options.failpoint?.("persisted");

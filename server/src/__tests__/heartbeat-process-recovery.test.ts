@@ -1712,6 +1712,44 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
   });
 
+  it("only preserves a legacy no-replay hold while its bound source authority is unchanged", async () => {
+    const held = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "cancelled", runErrorCode: "issue_assignee_changed" });
+    const [heldRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, held.runId));
+    await terminalizeLegacyExecution({ db, run: heldRun!, status: "cancelled" });
+    await db.insert(issueComments).values({ companyId: held.companyId, issueId: held.issueId, authorUserId: "responsible-user", body: "Keep the stop in place." });
+    const { settleUnrecoverableExecutions } = await import("../services/execution-recovery-resolution.js");
+    await settleUnrecoverableExecutions(db);
+    const [heldAction, heldIssue] = await Promise.all([
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, held.issueId)).then(rows => rows[0]),
+      db.select().from(issues).where(eq(issues.id, held.issueId)).then(rows => rows[0]),
+    ]);
+    expect(heldAction).toMatchObject({ outcome: "blocked", evidence: expect.objectContaining({ automaticRecovery: expect.objectContaining({ replay: "blocked" }) }) });
+    expect(heldIssue?.status).toBe("blocked");
+
+    const superseded = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "cancelled", runErrorCode: "issue_assignee_changed" });
+    const [supersededRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, superseded.runId));
+    await terminalizeLegacyExecution({ db, run: supersededRun!, status: "cancelled" });
+    await db.update(issues).set({
+      status: "in_review", statusVersion: sql`${issues.statusVersion} + 1`, assigneeAgentId: superseded.agentId,
+      executionState: { status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review", currentParticipant: { type: "agent", agentId: superseded.agentId, userId: null }, returnAssignee: { type: "agent", agentId: superseded.agentId, userId: null }, reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null },
+    }).where(eq(issues.id, superseded.issueId));
+    const [revisitedBeforeSettlement] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, superseded.runId));
+    await terminalizeLegacyExecution({ db, run: revisitedBeforeSettlement!, status: "cancelled" });
+    const [preservedAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, superseded.issueId));
+    expect(preservedAction?.evidence.sourceAuthorityBinding).toMatchObject({ status: "in_progress" });
+    await settleUnrecoverableExecutions(db);
+    const [supersededAction, supersededIssue] = await Promise.all([
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, superseded.issueId)).then(rows => rows[0]),
+      db.select().from(issues).where(eq(issues.id, superseded.issueId)).then(rows => rows[0]),
+    ]);
+    expect(supersededAction).toMatchObject({ outcome: "cancelled", evidence: expect.objectContaining({ automaticRecovery: expect.objectContaining({ replay: "superseded" }) }) });
+    expect(supersededIssue).toMatchObject({ status: "in_review", assigneeAgentId: superseded.agentId });
+    expect(await getExecutionBlocker(db, superseded.companyId, superseded.issueId)).toBeNull();
+    const [revisitedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, superseded.runId));
+    await terminalizeLegacyExecution({ db, run: revisitedRun!, status: "cancelled" });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, superseded.issueId))).toHaveLength(1);
+  });
+
   it("leaves hidden issues out of stranded-issue reconciliation", async () => {
     const { issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
