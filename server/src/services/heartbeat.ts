@@ -3439,6 +3439,46 @@ const heartbeatRunSafeColumns = {
   resultJson: heartbeatRunSafeResultJsonColumn,
 } as const;
 
+// Codex rollout capture already refuses source files larger than 8 MiB. Keep
+// the finalizer's private evidence read within that documented capture bound:
+// resultJson may be much larger because it also retains stdout/stderr, while
+// completion evidence is independently sanitized before event persistence.
+// Claude's collector has structural, rather than a whole-field, bounds; this
+// remains a finalizer materialization limit for both adapters, not a claim that
+// Claude transcript input is capped at the Codex rollout-file limit.
+const HEARTBEAT_RUN_COMPLETION_EVIDENCE_MAX_BYTES = 8 * 1024 * 1024;
+const HEARTBEAT_RUN_COMPLETION_EVIDENCE_OVERSIZE_REASON =
+  "completion_evidence_exceeds_private_projection_limit";
+const HEARTBEAT_RUN_COMPLETION_EVIDENCE_LOOKUP_FAILED_REASON =
+  "completion_evidence_private_projection_unavailable";
+const HEARTBEAT_RUN_COMPLETION_EVIDENCE_UNSAFE_ENCODING_REASON =
+  "completion_evidence_private_projection_unsafe_encoding";
+
+const heartbeatRunCompletionEvidenceResultJsonColumn = sql<Record<string, unknown> | null>`
+  case
+    when ${heartbeatRuns.resultJson} is null then null
+    when ${heartbeatRuns.resultJson} ? 'completionEvidence' = false then null
+    when octet_length((${heartbeatRuns.resultJson} -> 'completionEvidence')::text)
+      <= ${HEARTBEAT_RUN_COMPLETION_EVIDENCE_MAX_BYTES}
+      then jsonb_build_object(
+        'completionEvidence',
+        ${heartbeatRuns.resultJson} -> 'completionEvidence'
+      )
+    else null
+  end
+`.as("resultJson");
+
+const heartbeatRunCompletionEvidenceUnavailableReasonColumn = sql<string | null>`
+  case
+    when ${heartbeatRuns.resultJson} is not null
+      and ${heartbeatRuns.resultJson} ? 'completionEvidence'
+      and octet_length((${heartbeatRuns.resultJson} -> 'completionEvidence')::text)
+        > ${HEARTBEAT_RUN_COMPLETION_EVIDENCE_MAX_BYTES}
+      then ${HEARTBEAT_RUN_COMPLETION_EVIDENCE_OVERSIZE_REASON}
+    else null
+  end
+`.as("unavailableReason");
+
 const heartbeatRunSqlAsciiSafeColumns = {
   ...getTableColumns(heartbeatRuns),
   processGroupId: heartbeatRunProcessGroupIdColumn,
@@ -10527,6 +10567,29 @@ export function heartbeatService(
             ? heartbeatRunSqlAsciiSafeColumns
             : heartbeatRunSafeColumns,
       )
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // Finalizer-only projection. It deliberately does not widen getRun's public
+  // result JSON shape or materialize stdout/stderr solely to retain bounded
+  // adapter completion evidence before scratch cleanup.
+  async function getRunCompletionEvidenceResultJson(runId: string) {
+    // Match getRun's fail-closed SQL_ASCII policy. JSON text cannot be safely
+    // projected through an unknown legacy encoding, including if inspection
+    // itself fails, so leave only an explicit unavailable receipt.
+    if (await hasUnsafeTextProjectionDatabase()) {
+      return {
+        resultJson: null,
+        unavailableReason: HEARTBEAT_RUN_COMPLETION_EVIDENCE_UNSAFE_ENCODING_REASON,
+      };
+    }
+    return db
+      .select({
+        resultJson: heartbeatRunCompletionEvidenceResultJsonColumn,
+        unavailableReason: heartbeatRunCompletionEvidenceUnavailableReasonColumn,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
@@ -26051,6 +26114,21 @@ export function heartbeatService(
         }
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
           const terminalRun = latestRun;
+          let completionEvidenceResult: Awaited<
+            ReturnType<typeof getRunCompletionEvidenceResultJson>
+          > | null = null;
+          let completionEvidenceUnavailableReason: string | null = null;
+          try {
+            completionEvidenceResult =
+              await getRunCompletionEvidenceResultJson(terminalRun.id);
+          } catch (error) {
+            completionEvidenceUnavailableReason =
+              HEARTBEAT_RUN_COMPLETION_EVIDENCE_LOOKUP_FAILED_REASON;
+            logger.warn(
+              { err: error, runId: terminalRun.id },
+              "completion evidence private projection was unavailable",
+            );
+          }
           const providerTrace = await traceStore
             .getByRun(terminalRun.id, run.companyId)
             .catch((error) => {
@@ -26063,10 +26141,12 @@ export function heartbeatService(
           const completionEvidence = buildRunCompletionEvidence({
             runId: terminalRun.id,
             adapterType: completionEvidenceAdapterType,
-            adapterResultJson: terminalRun.resultJson,
+            adapterResultJson: completionEvidenceResult?.resultJson ?? null,
             providerTrace,
             providerTraceRequested,
           });
+          completionEvidenceUnavailableReason ??=
+            completionEvidenceResult?.unavailableReason ?? null;
           const scratchForCleanup = runScratch;
           let scratchCleanup: Awaited<
             ReturnType<typeof cleanupHeartbeatRunScratch>
@@ -26079,8 +26159,15 @@ export function heartbeatService(
                   eventType: "completion_evidence",
                   stream: "system",
                   level: "info",
-                  message: "run completion evidence recorded before scratch cleanup",
-                  payload: completionEvidence,
+                  message: completionEvidenceUnavailableReason
+                    ? `run completion evidence unavailable before scratch cleanup: ${completionEvidenceUnavailableReason}`
+                    : "run completion evidence recorded before scratch cleanup",
+                  payload: {
+                    ...completionEvidence,
+                    ...(completionEvidenceUnavailableReason
+                      ? { completionEvidenceUnavailableReason }
+                      : {}),
+                  },
                 }),
               cleanup: scratchForCleanup
                 ? async () => {
@@ -27136,6 +27223,55 @@ export function heartbeatService(
           }
 
           let reconciledSourceRunId: string | null = null;
+          let reconciliationDelivery: {
+            actionId: string;
+            sourceRunId: string;
+            decision: Record<string, unknown>;
+            adoptedWakeId: string | null;
+          } | null = null;
+          const recordReconciliationDelivery = async (runId: string) => {
+            const delivery = reconciliationDelivery;
+            if (!delivery) return;
+            await tx
+              .update(heartbeatRuns)
+              .set({ retryOfRunId: delivery.sourceRunId })
+              .where(and(
+                eq(heartbeatRuns.companyId, issue.companyId),
+                eq(heartbeatRuns.id, runId),
+                eq(heartbeatRuns.agentId, agentId),
+                sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${delivery.actionId}`,
+                sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${delivery.sourceRunId}`,
+              ));
+            const [recorded] = await tx
+              .update(issueRecoveryActions)
+              .set({
+                evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+                  continuationDelivery: "delivered",
+                  continuationRunId: runId,
+                })}::jsonb`,
+              })
+              .where(and(
+                eq(issueRecoveryActions.companyId, issue.companyId),
+                eq(issueRecoveryActions.id, delivery.actionId),
+                eq(issueRecoveryActions.status, "resolved"),
+                sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+                sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(delivery.decision)}::jsonb`,
+              ))
+              .returning({ id: issueRecoveryActions.id });
+            if (!recorded) throw new Error("reconciled_delivery_changed");
+            if (!delivery.adoptedWakeId) return;
+            const [adopted] = await tx
+              .update(agentWakeupRequests)
+              .set({ runId, updatedAt: new Date() })
+              .where(and(
+                eq(agentWakeupRequests.id, delivery.adoptedWakeId),
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.status, "coalesced"),
+                isNull(agentWakeupRequests.runId),
+              ))
+              .returning({ id: agentWakeupRequests.id });
+            if (!adopted) throw new Error("adopted_deferred_wake_changed");
+          };
           if (executionReconciliationWake) {
             const actionId = readNonEmptyString(
               enrichedContextSnapshot.recoveryActionId,
@@ -27175,6 +27311,23 @@ export function heartbeatService(
             const decision = parseObject(
               action?.evidence.executionReconciliation,
             );
+            const expectedAdoptedDeferredWake =
+              enrichedContextSnapshot.reconciliationAdoptedDeferredWake ?? null;
+            const recordedAdoptedDeferredWake =
+              action?.evidence.adoptedDeferredWake ?? null;
+            const expectedAdoption = parseObject(expectedAdoptedDeferredWake);
+            const adoptionMatches = (() => {
+              if (expectedAdoptedDeferredWake === null && recordedAdoptedDeferredWake === null) return true;
+              const expected = parseObject(expectedAdoptedDeferredWake);
+              const recorded = parseObject(recordedAdoptedDeferredWake);
+              const expectedIds = Array.isArray(expected.commentIds) ? expected.commentIds : [];
+              const recordedIds = Array.isArray(recorded.commentIds) ? recorded.commentIds : [];
+              return typeof expected.wakeId === "string" &&
+                expected.wakeId === recorded.wakeId &&
+                expectedIds.length > 0 &&
+                expectedIds.length === recordedIds.length &&
+                expectedIds.every((id, index) => typeof id === "string" && id === recordedIds[index]);
+            })();
             const sourceRunId = readNonEmptyString(decision.runId);
             if (
               !action ||
@@ -27188,6 +27341,7 @@ export function heartbeatService(
                 String(decision.actionOutcome),
               ) ||
               !readNonEmptyString(decision.outcomeEvidence) ||
+              !adoptionMatches ||
               enrichedContextSnapshot.previousRunId !== sourceRunId ||
               enrichedContextSnapshot.retryOfRunId !== sourceRunId ||
               !["pending", "delivered"].includes(
@@ -27235,11 +27389,35 @@ export function heartbeatService(
                 existingRun.contextSnapshot?.previousRunId !== sourceRunId
               )
                 return { kind: "deferred" as const };
+              if (
+                action.evidence.continuationDelivery === "delivered" &&
+                action.evidence.continuationRunId !== existingRun.id
+              )
+                return { kind: "deferred" as const };
+              if (action.evidence.continuationDelivery === "pending") {
+                reconciliationDelivery = {
+                  actionId: action.id,
+                  sourceRunId,
+                  decision,
+                  adoptedWakeId: typeof expectedAdoption.wakeId === "string"
+                    ? expectedAdoption.wakeId
+                    : null,
+                };
+                await recordReconciliationDelivery(existingRun.id);
+              }
               return { kind: "replayed" as const, run: existingRun };
             }
             if (action.evidence.continuationDelivery !== "pending")
               return { kind: "skipped" as const };
             reconciledSourceRunId = sourceRunId;
+            reconciliationDelivery = {
+              actionId: action.id,
+              sourceRunId,
+              decision,
+              adoptedWakeId: typeof expectedAdoption.wakeId === "string"
+                ? expectedAdoption.wakeId
+                : null,
+            };
           }
 
           let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
@@ -28208,6 +28386,8 @@ export function heartbeatService(
               updatedAt: new Date(),
             })
             .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+          await recordReconciliationDelivery(newRun.id);
 
           if (adoptedComments.length) {
             await tx
@@ -29534,6 +29714,9 @@ export function heartbeatService(
     },
 
     getRun,
+    // Internal finalizer seam, retained here so the database projection can be
+    // regression-tested without starting an adapter process.
+    getRunCompletionEvidenceResultJson,
 
     decorateActiveRunStatus: decorateHeartbeatRunRuntimeStatus,
     recordRuntimeProgress: recordCurrentHeartbeatRunRuntimeProgress,

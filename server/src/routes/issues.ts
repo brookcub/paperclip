@@ -3,6 +3,7 @@ import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
+  coalesceStaleExecutionReconciliation,
   validateExecutionReconciliation,
   markExecutionReconciliation,
 } from "../services/execution-recovery-resolution.js";
@@ -9324,7 +9325,15 @@ export function issueRoutes(
           }
         }
 
-        if (executionReconciliation) {
+        const coalescedHistoricalRecovery = executionReconciliation && !chatRetry
+          ? await coalesceStaleExecutionReconciliation(
+              tx as unknown as Db,
+              activeRecoveryAction,
+              lockedIssue,
+              executionReconciliation,
+            )
+          : false;
+        if (executionReconciliation && !coalescedHistoricalRecovery) {
           // The authorized chat retry is the sole durable delivery owner.
           // Never also enqueue a generic successor that lacks chat provenance.
           await markExecutionReconciliation(

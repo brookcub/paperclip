@@ -834,6 +834,10 @@ export function createPostgresRunDispatchAdapter(
           errorCode: decision.errorCode,
           resultJson: {
             ...parseObject(run.resultJson),
+            // Both callers reach this helper before the adapter handoff. This
+            // cancellation therefore has a known zero-action boundary, even
+            // when the run has already moved from queued to running.
+            executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
             stopReason: decision.errorCode,
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
