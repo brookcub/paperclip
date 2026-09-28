@@ -26116,7 +26116,7 @@ export function heartbeatService(
           const terminalRun = latestRun;
           let completionEvidenceResult: Awaited<
             ReturnType<typeof getRunCompletionEvidenceResultJson>
-          > = null;
+          > | null = null;
           let completionEvidenceUnavailableReason: string | null = null;
           try {
             completionEvidenceResult =
