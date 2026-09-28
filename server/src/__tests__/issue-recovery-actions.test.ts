@@ -1913,6 +1913,176 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     };
   }
 
+  it.each(["reassigned", "cancelled"] as const)(
+    "atomically closes an adopted saved-comment wake when its canonical delivery is %s",
+    async (change) => {
+      const { action, companyId, coderId, managerId, sourceIssueId, heartbeat } =
+        await seedReconciledDelivery();
+      const userId = randomUUID();
+      const commentId = randomUUID();
+      const wakeId = randomUUID();
+      await db.insert(authUsers).values({
+        id: userId,
+        name: "Recovery operator",
+        email: `${userId}@example.test`,
+        emailVerified: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      await db.insert(issueComments).values({
+        id: commentId,
+        companyId,
+        issueId: sourceIssueId,
+        authorUserId: userId,
+        authorType: "user",
+        body: "Keep this operator comment intact.",
+      });
+      await db.insert(agentWakeupRequests).values({
+        id: wakeId,
+        companyId,
+        agentId: coderId,
+        source: "on_demand",
+        triggerDetail: "saved operator resume",
+        reason: "issue_commented",
+        status: "coalesced",
+        requestedByActorType: "user",
+        requestedByActorId: userId,
+        payload: { issueId: sourceIssueId, commentId },
+      });
+      await db.update(issueRecoveryActions).set({
+        evidence: {
+          ...action.evidence,
+          adoptedDeferredWake: { wakeId, commentIds: [commentId] },
+        },
+      }).where(eq(issueRecoveryActions.id, action.id));
+      const [commentBefore] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+      await db.update(issues).set(
+        change === "reassigned"
+          ? { assigneeAgentId: managerId }
+          : { status: "cancelled" },
+      ).where(eq(issues.id, sourceIssueId));
+
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+
+      const [[receipt], [wake], [commentAfter], successorWakes] = await Promise.all([
+        db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)),
+        db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)),
+        db.select().from(issueComments).where(eq(issueComments.id, commentId)),
+        db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${action.id}`)),
+      ]);
+      expect(receipt!.evidence).toMatchObject({
+        continuationDelivery: "invalidated",
+        adoptedDeferredWake: { wakeId, commentIds: [commentId] },
+        adoptedDeferredWakeDisposition: { wakeId, disposition: "cancelled" },
+      });
+      expect(wake).toMatchObject({ status: "cancelled", runId: null });
+      expect(commentAfter).toEqual(commentBefore);
+      expect(successorWakes).toHaveLength(0);
+    },
+  );
+
+  it("keeps a pending delivery when the invalidator lock re-read finds a newer matching owner", async () => {
+    const { action, heartbeat, managerId, sourceIssueId } = await seedReconciledDelivery();
+    await db.update(issues).set({ assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    let enteredInvalidator = false;
+    const originalTransaction = db.transaction.bind(db);
+    const interleavedDb = new Proxy(db, {
+      get(target, property, receiver) {
+        if (property === "transaction") {
+          return async (...args: Parameters<typeof db.transaction>) => {
+            if (!enteredInvalidator) {
+              enteredInvalidator = true;
+              await db.update(issueRecoveryActions)
+                .set({ returnOwnerAgentId: managerId })
+                .where(eq(issueRecoveryActions.id, action.id));
+            }
+            return originalTransaction(...args);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as typeof db;
+    await deliverReconciledExecutions(interleavedDb, heartbeat.wakeup);
+    expect(enteredInvalidator).toBe(true);
+    const [receipt] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(receipt!.evidence.continuationDelivery).toBe("pending");
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${action.id}`))).toHaveLength(0);
+  });
+
+  it("rolls back reconciliation admission when its adopted wake changed", async () => {
+    const { action, companyId, coderId, sourceIssueId, heartbeat } = await seedReconciledDelivery();
+    const adoptedWakeId = randomUUID();
+    const sourceRunId = (action.evidence.executionReconciliation as { runId: string }).runId;
+    await db.insert(agentWakeupRequests).values({
+      id: adoptedWakeId,
+      companyId,
+      agentId: coderId,
+      source: "on_demand",
+      reason: "issue_commented",
+      status: "cancelled",
+      payload: { issueId: sourceIssueId },
+    });
+    await db.update(issueRecoveryActions).set({
+      evidence: {
+        ...action.evidence,
+        adoptedDeferredWake: { wakeId: adoptedWakeId, commentIds: [randomUUID()] },
+      },
+    }).where(eq(issueRecoveryActions.id, action.id));
+
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+
+    const [[receipt], wakes, runs] = await Promise.all([
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${action.id}`)),
+      db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, sourceRunId)),
+    ]);
+    expect(receipt!.evidence.continuationDelivery).toBe("pending");
+    expect(wakes).toHaveLength(0);
+    expect(runs).toHaveLength(0);
+  });
+
+  it("commits reconciliation delivery before a post-admission owner change can orphan its successor", async () => {
+    const { action, companyId, coderId, managerId, sourceIssueId, heartbeat } = await seedReconciledDelivery();
+    const adoptedWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: adoptedWakeId,
+      companyId,
+      agentId: coderId,
+      source: "on_demand",
+      reason: "issue_commented",
+      status: "coalesced",
+      payload: { issueId: sourceIssueId },
+    });
+    await db.update(issueRecoveryActions).set({
+      evidence: {
+        ...action.evidence,
+        adoptedDeferredWake: { wakeId: adoptedWakeId, commentIds: [randomUUID()] },
+      },
+    }).where(eq(issueRecoveryActions.id, action.id));
+
+    await deliverReconciledExecutions(db, async (...args) => {
+      const run = await heartbeat.wakeup(...args);
+      await db.update(issues).set({ assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      return run;
+    });
+
+    const [[receipt], [adopted], wakes] = await Promise.all([
+      db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, adoptedWakeId)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${action.id}`)),
+    ]);
+    expect(wakes).toHaveLength(1);
+    expect(receipt!.evidence).toMatchObject({
+      continuationDelivery: "delivered",
+      continuationRunId: wakes[0]!.runId,
+    });
+    expect(adopted).toMatchObject({ status: "coalesced", runId: wakes[0]!.runId });
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${action.id}`))).toHaveLength(1);
+  });
+
   it("delivers a reconciled execution once across concurrent sweeps without a deferred duplicate", async () => {
     const { action, heartbeat } = await seedReconciledDelivery();
     let entered = 0;

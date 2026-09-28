@@ -427,6 +427,112 @@ export async function coalesceStaleExecutionReconciliation(
   return true;
 }
 
+async function invalidateReconciledDelivery(
+  db: Db,
+  action: typeof issueRecoveryActions.$inferSelect,
+  decision: ExecutionReconciliation,
+) {
+  return db.transaction(async (tx) => {
+    await tx.execute(
+      sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
+    );
+    const [task] = await tx
+      .select()
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, action.companyId),
+        eq(issues.id, action.sourceIssueId),
+      ))
+      .for("update");
+    const [current] = await tx
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, action.companyId),
+        eq(issueRecoveryActions.id, action.id),
+      ))
+      .for("update");
+    if (
+      !current ||
+      current.sourceIssueId !== action.sourceIssueId ||
+      current.status !== "resolved" ||
+      current.evidence.continuationDelivery !== "pending"
+    ) return false;
+    const reason = !task
+      ? "source_issue_missing"
+      : ["done", "cancelled"].includes(task.status)
+        ? `source_issue_${task.status}`
+        : task.assigneeAgentId !== current.returnOwnerAgentId
+          ? "source_issue_owner_changed"
+          : null;
+    if (!reason) return false;
+    const adoption = adoptedDeferredWake(current.evidence);
+    if (adoption) {
+      const [wake] = await tx
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, current.companyId),
+          eq(agentWakeupRequests.id, adoption.wakeId),
+        ))
+        .for("update");
+      if (!wake || wake.status !== "coalesced" || wake.runId !== null) {
+        throw new Error("adopted_deferred_wake_changed");
+      }
+      const [closed] = await tx
+        .update(agentWakeupRequests)
+        .set({
+          status: "cancelled",
+          error: `Execution reconciliation invalidated: ${reason}`,
+          finishedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(agentWakeupRequests.id, wake.id),
+          eq(agentWakeupRequests.companyId, current.companyId),
+          eq(agentWakeupRequests.status, "coalesced"),
+          isNull(agentWakeupRequests.runId),
+        ))
+        .returning({ id: agentWakeupRequests.id });
+      if (!closed) throw new Error("adopted_deferred_wake_changed");
+    }
+    const [invalidated] = await tx
+      .update(issueRecoveryActions)
+      .set({
+        evidence: {
+          ...current.evidence,
+          continuationDelivery: "invalidated",
+          ...(adoption ? {
+            adoptedDeferredWakeDisposition: {
+              wakeId: adoption.wakeId,
+              disposition: "cancelled",
+              reason,
+            },
+          } : {}),
+        },
+      })
+      .where(and(
+        eq(issueRecoveryActions.companyId, current.companyId),
+        eq(issueRecoveryActions.id, current.id),
+        eq(issueRecoveryActions.status, "resolved"),
+        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`,
+      ))
+      .returning({ id: issueRecoveryActions.id });
+    if (!invalidated) throw new Error("reconciled_delivery_changed");
+    await persistActivity(tx as unknown as Db, {
+      companyId: current.companyId,
+      actorType: "system",
+      actorId: "execution-recovery",
+      action: "issue.execution_recovery_delivery_invalidated",
+      entityType: "issue",
+      entityId: current.sourceIssueId,
+      details: { recoveryActionId: current.id, reason, adoptedWakeId: adoption?.wakeId ?? null },
+    });
+    return true;
+  });
+}
+
 export async function deliverReconciledExecutions(
   db: Db,
   wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
@@ -447,13 +553,6 @@ export async function deliverReconciledExecutions(
         ExecutionReconciliation | undefined;
       if (!decision || !action.returnOwnerAgentId) continue;
       const adoption = adoptedDeferredWake(action.evidence);
-      const pendingDecision = and(
-        eq(issueRecoveryActions.companyId, action.companyId),
-        eq(issueRecoveryActions.id, action.id),
-        eq(issueRecoveryActions.status, "resolved"),
-        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
-        sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`,
-      );
       const [task] = await db
         .select()
         .from(issues)
@@ -468,12 +567,9 @@ export async function deliverReconciledExecutions(
         task.assigneeAgentId !== action.returnOwnerAgentId ||
         ["done", "cancelled"].includes(task.status)
       ) {
-        await db
-          .update(issueRecoveryActions)
-          .set({
-            evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated"}'::jsonb`,
-          })
-          .where(pendingDecision);
+        // Lock and re-read before closing custody: a stale scan must not
+        // invalidate a continuation that became current or delivered.
+        await invalidateReconciledDelivery(db, action, decision);
         continue;
       }
       const wakePayload = adoption
@@ -496,7 +592,7 @@ export async function deliverReconciledExecutions(
       const wakeContext = adoption
         ? withQueuedCommentIdsInRunContext(wakeContextBase, adoption.commentIds)
         : wakeContextBase;
-      const run = await wake(action.returnOwnerAgentId, {
+      await wake(action.returnOwnerAgentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_recovery_action_restored",
@@ -506,45 +602,6 @@ export async function deliverReconciledExecutions(
         requestedByActorId: "execution-recovery",
         contextSnapshot: wakeContext,
       });
-      if (run)
-        await db.transaction(async (tx) => {
-          await tx
-            .update(heartbeatRuns)
-            .set({ retryOfRunId: decision.runId })
-            .where(
-              and(
-                eq(heartbeatRuns.companyId, action.companyId),
-                eq(heartbeatRuns.id, run.id),
-                eq(heartbeatRuns.agentId, action.returnOwnerAgentId!),
-                sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' = ${action.id}`,
-                sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${decision.runId}`,
-              ),
-            );
-          await tx
-            .update(issueRecoveryActions)
-            .set({
-              evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(
-                {
-                  continuationDelivery: "delivered",
-                  continuationRunId: run.id,
-                },
-              )}::jsonb`,
-            })
-            .where(pendingDecision);
-          if (adoption) {
-            const [adopted] = await tx
-              .update(agentWakeupRequests)
-              .set({ runId: run.id, updatedAt: new Date() })
-              .where(and(
-                eq(agentWakeupRequests.id, adoption.wakeId),
-                eq(agentWakeupRequests.companyId, action.companyId),
-                eq(agentWakeupRequests.status, "coalesced"),
-                isNull(agentWakeupRequests.runId),
-              ))
-              .returning({ id: agentWakeupRequests.id });
-            if (!adopted) throw new Error("adopted_deferred_wake_changed");
-          }
-        });
     } catch {
       logger.warn(
         { recoveryActionId: action.id },
