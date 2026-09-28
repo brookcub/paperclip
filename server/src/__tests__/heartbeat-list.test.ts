@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -25,7 +25,8 @@ describeEmbeddedPostgres("heartbeat list", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-list-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+    // Embedded Postgres cold-starts slowly on a loaded machine.
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(heartbeatRuns);
@@ -402,6 +403,16 @@ describeEmbeddedPostgres("heartbeat list", () => {
       resultJson: null,
       unavailableReason: "completion_evidence_exceeds_private_projection_limit",
     });
+
+    const unsafeEncodingService = heartbeatService(db);
+    const execute = vi.spyOn(db, "execute").mockResolvedValue([
+      { server_encoding: "SQL_ASCII" },
+    ] as never);
+    await expect(unsafeEncodingService.getRunCompletionEvidenceResultJson(runId)).resolves.toEqual({
+      resultJson: null,
+      unavailableReason: "completion_evidence_private_projection_unsafe_encoding",
+    });
+    execute.mockRestore();
   });
 });
 

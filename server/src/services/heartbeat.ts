@@ -3451,6 +3451,8 @@ const HEARTBEAT_RUN_COMPLETION_EVIDENCE_OVERSIZE_REASON =
   "completion_evidence_exceeds_private_projection_limit";
 const HEARTBEAT_RUN_COMPLETION_EVIDENCE_LOOKUP_FAILED_REASON =
   "completion_evidence_private_projection_unavailable";
+const HEARTBEAT_RUN_COMPLETION_EVIDENCE_UNSAFE_ENCODING_REASON =
+  "completion_evidence_private_projection_unsafe_encoding";
 
 const heartbeatRunCompletionEvidenceResultJsonColumn = sql<Record<string, unknown> | null>`
   case
@@ -10574,6 +10576,15 @@ export function heartbeatService(
   // result JSON shape or materialize stdout/stderr solely to retain bounded
   // adapter completion evidence before scratch cleanup.
   async function getRunCompletionEvidenceResultJson(runId: string) {
+    // Match getRun's fail-closed SQL_ASCII policy. JSON text cannot be safely
+    // projected through an unknown legacy encoding, including if inspection
+    // itself fails, so leave only an explicit unavailable receipt.
+    if (await hasUnsafeTextProjectionDatabase()) {
+      return {
+        resultJson: null,
+        unavailableReason: HEARTBEAT_RUN_COMPLETION_EVIDENCE_UNSAFE_ENCODING_REASON,
+      };
+    }
     return db
       .select({
         resultJson: heartbeatRunCompletionEvidenceResultJsonColumn,
