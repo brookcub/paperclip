@@ -6,6 +6,7 @@ import {
   agents,
   companies,
   createDb,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   documentRevisions,
   documents,
   heartbeatRunEvents,
@@ -24,6 +25,7 @@ import {
 import { createPostgresRunDispatchAdapter } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { legacyExecutionNeedsReconciliation } from "../../../services/legacy-execution-recovery.js";
 
 // Proves the DB-to-facts mapping this adapter owns for each state the two
 // run-dispatch gates decide on. `application/use-cases.test.ts` and
@@ -48,7 +50,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-run-dispatch-postgres-adapter-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     await db.delete(activityLog);
@@ -290,7 +292,11 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
     expect(gate.dispatched).toBe(true);
     if (gate.dispatched) expect(await gate.resultPromise).toBe("provider_checkpoint_failed_terminal");
-    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status).toBe("failed");
+    const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(failed?.status).toBe("failed");
+    // This path entered dispatch, so it must not inherit the pre-dispatch
+    // bootstrap proof and remains conservatively reconcilable.
+    expect(legacyExecutionNeedsReconciliation(failed!)).toBe(true);
   });
 
   it("initiates dispatch before admission locks can be released to a competing owner", async () => {
@@ -521,6 +527,42 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
   });
 
   describe("cancelStaleQueuedRun", () => {
+    it.each(["queued", "running"] as const)(
+      "records known no-provider evidence when the stale %s gate cancels before dispatch",
+      async (status) => {
+        const { companyId, agentId } = await seedCompanyAndAgent();
+        const replacementAgentId = randomUUID();
+        await seedAgent({ id: replacementAgentId, companyId, name: "ReplacementCoder" });
+        const issueId = randomUUID();
+        await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: replacementAgentId });
+        const runId = await seedRun({ companyId, agentId, status, contextSnapshot: { issueId, wakeReason: "issue_assigned" } });
+        const adapter = createPostgresRunDispatchAdapter(db);
+
+        if (status === "queued") {
+          expect(await adapter.cancelStaleQueuedRun({ companyId, runId, expectedStatus: "queued", now: new Date() }))
+            .toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+        } else {
+          const dispatch = vi.fn(async () => undefined);
+          expect(await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId, expectedStatus: "running", now: new Date(), dispatch }))
+            .toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_assignee_changed" } });
+          expect(dispatch).not.toHaveBeenCalled();
+        }
+
+        const persisted = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]!);
+        expect(persisted).toMatchObject({
+          status: "cancelled",
+          resultJson: {
+            executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+            timeoutSource: "stale_queued_run_gate",
+          },
+        });
+        expect(legacyExecutionNeedsReconciliation(persisted)).toBe(false);
+        // The existing retry-budget policy deliberately takes precedence over
+        // bootstrap evidence; this change does not alter that boundary.
+        expect(legacyExecutionNeedsReconciliation({ ...persisted, scheduledRetryAttempt: 2 })).toBe(true);
+      },
+    );
+
     it.each([
       { label: "chat source", source: "chat:slack", expected: "chat:slack" },
       {
