@@ -8,6 +8,9 @@ const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
 const gateway = { name: "paperclip-projects", endpointPath: "/mcp/projects", bearerToken: "fixture-token" };
 const policy = { server: gateway.name, tool: "create_task", approvalMode: "approve" };
+const c06Tool = "mcp.app-gallery-link-293d5546-97b4-47b1-bc0f-2b7edd9981eb-bd7c29b3:kv-get";
+const truncatedSlug = `${"a".repeat(63)}-`;
+const maxGeneratedTool = `mcp.${truncatedSlug}-1234abcd:${truncatedSlug}-deadbeef`;
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "pc-mcp-policy-"));
   roots.push(root);
@@ -51,9 +54,30 @@ describe("managed Codex per-tool approvals", () => {
   });
 
   it.each([
+    c06Tool,
+    "mcp.kv-demo-bd7c29b3:kv-get-daad6b60",
+    `mcp.${truncatedSlug}-1234abcd:kv-get`,
+    maxGeneratedTool,
+  ])("serializes exact connected MCP tool name %s without normalization", async (tool) => {
+    const f = await fixture();
+    await writeManagedCodexMcpConfig({
+      ...f.input,
+      toolApprovals: [{ server: gateway.name, tool, approvalMode: "auto" }],
+    });
+    expect(await fs.readFile(f.configPath, "utf8")).toContain(
+      `[mcp_servers."paperclip-projects".tools."${tool}"]\napproval_mode = "auto"`,
+    );
+  });
+
+  it.each([
     null, {}, [null], ["approve"], [{ ...policy, url: "http://example.invalid" }],
     [{ ...policy, server: "unmanaged" }], [{ ...policy, server: "*" }],
     [{ ...policy, tool: "*" }], [{ ...policy, tool: 'create_task"\n[evil]' }],
+    [{ ...policy, tool: "mcp.kv-demo-bd7c29b3:kv-get*" }],
+    [{ ...policy, tool: 'mcp.kv-demo-bd7c29b3:kv-get"\n[evil]' }],
+    [{ ...policy, tool: "mcp.kv-demo-bd7c29b3:kv/get" }],
+    [{ ...policy, tool: "mcp..kv-demo-bd7c29b3:kv-get" }],
+    [{ ...policy, tool: `mcp.${"a".repeat(65)}-1234abcd:kv-get` }],
     [{ ...policy, approvalMode: "bypass" }], [{ server: gateway.name, tool: "create_task" }],
     [policy, policy],
   ])("rejects invalid policy without modifying configuration: %j", async (toolApprovals) => {

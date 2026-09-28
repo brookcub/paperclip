@@ -291,6 +291,18 @@ type ManagedMcpToolApproval = {
   approvalMode: "auto" | "prompt" | "writes" | "approve";
 };
 
+const SIMPLE_MCP_TOOL_NAME = /^[A-Za-z0-9_-]{1,128}$/;
+const CONNECTED_MCP_TOOL_NAME = /^mcp\.([a-z0-9]+(?:-[a-z0-9]+)*-?)-([0-9a-f]{8}):([a-z0-9]+(?:-[a-z0-9]+)*-?)(?:-([0-9a-f]{8}))?$/;
+const MAX_CONNECTED_MCP_TOOL_NAME_LENGTH = 151;
+
+/** Matches the exact name shape emitted for a connected MCP catalog entry. */
+function isExactMcpToolName(value: string): boolean {
+  if (SIMPLE_MCP_TOOL_NAME.test(value)) return true;
+  if (value.length > MAX_CONNECTED_MCP_TOOL_NAME_LENGTH) return false;
+  const match = CONNECTED_MCP_TOOL_NAME.exec(value);
+  return Boolean(match && match[1].length <= 64 && match[3].length <= 64);
+}
+
 /** Only typed per-tool policy is accepted; transport, credentials and defaults stay managed. */
 function parseManagedMcpToolApprovals(
   value: unknown,
@@ -309,7 +321,7 @@ function parseManagedMcpToolApprovals(
       || gateways.filter((gateway) => gateway.name === server).length !== 1) {
       throw new Error("managedMcpToolApprovals server must identify exactly one active managed gateway");
     }
-    if (typeof tool !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(tool)) {
+    if (typeof tool !== "string" || !isExactMcpToolName(tool)) {
       throw new Error("managedMcpToolApprovals tool must be an exact MCP tool name");
     }
     if (!["auto", "prompt", "writes", "approve"].includes(approvalMode)) {
