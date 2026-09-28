@@ -48,6 +48,7 @@ import {
   closeRegisteredClients,
   documentRevisions,
   documents,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   environmentLeases,
   environments,
   executionWorkspaces,
@@ -472,7 +473,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       createdAt: now,
       updatedAt: now,
     });
-  }, 20_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     vi.clearAllMocks();
