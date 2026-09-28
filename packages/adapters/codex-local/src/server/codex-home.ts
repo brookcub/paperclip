@@ -292,15 +292,25 @@ type ManagedMcpToolApproval = {
 };
 
 const SIMPLE_MCP_TOOL_NAME = /^[A-Za-z0-9_-]{1,128}$/;
-const CONNECTED_MCP_TOOL_NAME = /^mcp\.([a-z0-9]+(?:-[a-z0-9]+)*-?)-([0-9a-f]{8}):([a-z0-9]+(?:-[a-z0-9]+)*-?)(?:-([0-9a-f]{8}))?$/;
+const CONNECTED_MCP_NAMESPACE = /^mcp\.([a-z0-9]+(?:-[a-z0-9]+)*-?)-([0-9a-f]{8}):(.+)$/;
+const CONNECTED_MCP_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*-?$/;
+const CONNECTED_MCP_COLLISION_SUFFIX = /^(.*)-[0-9a-f]{8}$/;
 const MAX_CONNECTED_MCP_TOOL_NAME_LENGTH = 151;
 
 /** Matches the exact name shape emitted for a connected MCP catalog entry. */
 function isExactMcpToolName(value: string): boolean {
   if (SIMPLE_MCP_TOOL_NAME.test(value)) return true;
   if (value.length > MAX_CONNECTED_MCP_TOOL_NAME_LENGTH) return false;
-  const match = CONNECTED_MCP_TOOL_NAME.exec(value);
-  return Boolean(match && match[1].length <= 64 && match[3].length <= 64);
+  const match = CONNECTED_MCP_NAMESPACE.exec(value);
+  if (!match || match[1].length > 64) return false;
+  const toolName = match[3];
+  if (toolName.length <= 64 && CONNECTED_MCP_SLUG.test(toolName)) return true;
+  const collision = CONNECTED_MCP_COLLISION_SUFFIX.exec(toolName);
+  return Boolean(
+    collision
+      && collision[1].length <= 64
+      && CONNECTED_MCP_SLUG.test(collision[1]),
+  );
 }
 
 /** Only typed per-tool policy is accepted; transport, credentials and defaults stay managed. */
