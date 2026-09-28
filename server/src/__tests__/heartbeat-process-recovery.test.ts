@@ -7920,7 +7920,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toHaveLength(1);
     const issue = await db.select().from(issues).where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
-    expect(issue).toMatchObject({ status: "in_progress", executionRunId: null });
+    expect(issue).toMatchObject({
+      status: "in_progress",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
   });
 
   it("records operator interrupt cancellation metadata without changing terminal status", async () => {

@@ -28898,7 +28898,7 @@ export function heartbeatService(
     eventPayload?: Record<string, unknown>;
     /** Per-call graceful process shutdown window, bounded to a safe range. */
     terminationGraceMs?: number;
-    /** Caller is immediately scheduling an explicit successor path. */
+    /** Suppress automatic same-issue recovery; already-admitted deferred wakes are unaffected. */
     suppressImmediateRecovery?: boolean;
     /** The enclosing queue scan will continue its own agent scheduling. */
     suppressNextQueuedRunStart?: boolean;
