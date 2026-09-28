@@ -17,21 +17,6 @@ function normalizeFixturePath(value: string): string {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
-async function resolveFixtureSandboxCommand(command: string): Promise<string> {
-  if (process.platform !== "win32" || command !== "sh") return command;
-  for (const candidate of [
-    "C:\\Program Files\\Git\\bin\\sh.exe",
-    "C:\\Program Files\\Git\\usr\\bin\\sh.exe",
-  ]) {
-    try {
-      await fs.access(candidate);
-      return candidate;
-    } catch {}
-  }
-  throw new Error("Windows sandbox fixture requires Git Bash sh.exe");
-}
-
-
 function claudeCommandPath(directory: string): string {
   return path.join(directory, process.platform === "win32" ? "claude.cmd" : "claude");
 }
@@ -370,10 +355,9 @@ function createLocalSandboxRunner() {
       onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
     }) => {
       counter += 1;
-      const command = await resolveFixtureSandboxCommand(input.command);
       return runChildProcess(
         `sandbox-run-${counter}`,
-        command,
+        input.command,
         input.args ?? [],
         {
           cwd: input.cwd ?? process.cwd(),
