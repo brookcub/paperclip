@@ -396,6 +396,20 @@ describe("agent routes adapter validation", () => {
     expect(unchanged.status, JSON.stringify(unchanged.body)).toBe(200);
     expect(mockAiConnectionService.select).not.toHaveBeenCalled();
 
+    mockAgentService.update.mockClear();
+    const adapterOnly = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig: { effort: "low" } }),
+    );
+
+    expect(adapterOnly.status, JSON.stringify(adapterOnly.body)).toBe(200);
+    expect(mockAiConnectionService.select).not.toHaveBeenCalled();
+    expect(mockAgentService.update).toHaveBeenCalledOnce();
+    expect(mockAgentService.update.mock.calls[0]?.[1]).toMatchObject({
+      adapterConfig: { model: "claude-sonnet-4-6", effort: "low" },
+    });
+
     const { unprocessable } = await import("../errors.js");
     mockAiConnectionService.select.mockRejectedValueOnce(unprocessable("changed binding validation"));
     const changed = await requestApp(app, (baseUrl) =>
