@@ -78,6 +78,13 @@ const mockRemoteAgentProfileService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockAiConnectionService = vi.hoisted(() => ({
+  select: vi.fn(),
+}));
+
+vi.mock("../services/ai-connections.js", () => ({
+  aiConnectionService: () => mockAiConnectionService,
+}));
 
 vi.mock("../services/index.js", () => ({
   agentService: () => mockAgentService,
@@ -113,6 +120,9 @@ vi.mock("../services/remote-agent-profiles.js", () => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/ai-connections.js", () => ({
+    aiConnectionService: () => mockAiConnectionService,
+  }));
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
     agentInstructionsService: () => mockAgentInstructionsService,
@@ -248,6 +258,7 @@ describe("agent routes adapter validation", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue([]);
+    mockAiConnectionService.select.mockReset();
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
     mockCompanySkillService.resolveRequestedSkillKeys.mockResolvedValue([]);
     mockAccessService.canUser.mockResolvedValue(true);
@@ -354,6 +365,77 @@ describe("agent routes adapter validation", () => {
       const invalid = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/adapters/paperclip_runner/models?provider=acpx_codex"));
       expect(invalid.status).toBe(422);
     } finally { list.mockRestore(); refresh.mockRestore(); }
+  });
+
+  it("skips managed validation only for a semantically unchanged binding", async () => {
+    const existing = await mockAgentService.getById();
+    const storedBinding = {
+      mode: "responsible_user",
+      method: "subscription",
+      provider: "anthropic",
+    } as const;
+    const requestedBinding = {
+      provider: "anthropic",
+      method: "subscription",
+      mode: "responsible_user",
+    } as const;
+    mockAgentService.getById.mockResolvedValue({
+      ...existing,
+      adapterType: "claude_local",
+      adapterConfig: { model: "claude-sonnet-4-6" },
+      runtimeConfig: { aiConnection: storedBinding },
+    });
+    const app = await createApp();
+
+    const unchanged = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: { aiConnection: requestedBinding } }),
+    );
+
+    expect(unchanged.status, JSON.stringify(unchanged.body)).toBe(200);
+    expect(mockAiConnectionService.select).not.toHaveBeenCalled();
+
+    mockAgentService.update.mockClear();
+    const adapterOnly = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig: { effort: "low" } }),
+    );
+
+    expect(adapterOnly.status, JSON.stringify(adapterOnly.body)).toBe(200);
+    expect(mockAiConnectionService.select).not.toHaveBeenCalled();
+    expect(mockAgentService.update).toHaveBeenCalledOnce();
+    expect(mockAgentService.update.mock.calls[0]?.[1]).toMatchObject({
+      adapterConfig: { model: "claude-sonnet-4-6", effort: "low" },
+    });
+
+    const { unprocessable } = await import("../errors.js");
+    mockAiConnectionService.select.mockRejectedValueOnce(unprocessable("changed binding validation"));
+    const changed = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: { aiConnection: { ...requestedBinding, method: "api_key" } } }),
+    );
+
+    expect(changed.status, JSON.stringify(changed.body)).toBe(422);
+    expect(mockAiConnectionService.select).toHaveBeenCalledOnce();
+
+    mockAgentService.getById.mockResolvedValue({
+      ...existing,
+      adapterType: "claude_local",
+      adapterConfig: { model: "claude-sonnet-4-6" },
+      runtimeConfig: { aiConnection: { provider: "anthropic", mode: "responsible_user" } },
+    });
+    mockAiConnectionService.select.mockRejectedValueOnce(unprocessable("invalid stored binding validation"));
+    const invalidStored = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: { aiConnection: requestedBinding } }),
+    );
+
+    expect(invalidStored.status, JSON.stringify(invalidStored.body)).toBe(422);
+    expect(mockAiConnectionService.select).toHaveBeenCalledTimes(2);
   });
 
   it("creates agents for dynamically registered external adapter types", async () => {

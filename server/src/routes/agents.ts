@@ -438,6 +438,13 @@ async function withHireRunLock<T>(key: string, fn: () => Promise<T>): Promise<T>
   }
 }
 
+function aiConnectionBindingChanged(
+  next: AiConnectionBinding,
+  existing: unknown,
+) {
+  return JSON.stringify(next) !== JSON.stringify(aiConnectionBindingSchema.safeParse(existing).data);
+}
+
 export function agentRoutes(
   db: Db,
   options: {
@@ -5287,7 +5294,7 @@ export function agentRoutes(
     const nextAiBinding = aiConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {
       await assertCanUpdateAgent(req, existing);
-      const changed = JSON.stringify(nextAiBinding) !== JSON.stringify(existing.runtimeConfig.aiConnection);
+      const changed = aiConnectionBindingChanged(nextAiBinding, existing.runtimeConfig.aiConnection);
       const aiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
       if (!isAiConnectionCompatible(nextAiBinding, requestedAdapterType, aiConfig.model, aiConfig.provider, aiConfig.acpxAgent)) throw unprocessable("Select an AI connection compatible with the new harness and model");
       if (changed) await validateManagedAgentBinding(req, existing.companyId, existing.id, requestedAdapterType, aiConfig, nextAiBinding, (patchData.defaultEnvironmentId !== undefined ? patchData.defaultEnvironmentId : existing.defaultEnvironmentId) as string | null, true);
