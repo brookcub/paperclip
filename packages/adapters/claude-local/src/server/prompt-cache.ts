@@ -48,14 +48,9 @@ async function hashPathContents(
   const stat = await fs.lstat(candidate);
 
   if (stat.isSymbolicLink()) {
-    hash.update(`symlink:${relativePath}\n`);
-    const resolved = await fs.realpath(candidate).catch(() => null);
-    if (!resolved) {
-      hash.update("missing\n");
-      return;
-    }
-    await hashPathContents(resolved, hash, relativePath, seenDirectories);
-    return;
+    throw new Error(
+      `Refusing Claude prompt-cache skill with symbolic link at ${relativePath || "."}.`,
+    );
   }
 
   if (stat.isDirectory()) {
