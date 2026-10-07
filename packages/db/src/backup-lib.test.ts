@@ -75,6 +75,36 @@ describe("createBufferedTextFileWriter", () => {
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it("keeps no more than seven dumps while retaining weekly and monthly history", async () => {
+    const connectionString = await createTempDatabase();
+    const backupDir = createTempDir("paperclip-db-backup-seven-");
+    const realDateNow = Date.now;
+    const now = Date.UTC(2026, 2, 31, 12);
+    Date.now = () => now;
+    try {
+      for (let age = 1; age <= 35; age++) {
+        const date = new Date(now - age * 86400000);
+        const file = path.join(backupDir, `paperclip-test-old-${age}.sql.gz`);
+        fs.writeFileSync(file, "old backup");
+        fs.utimesSync(file, date, date);
+      }
+      await runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1, maxFiles: 7 },
+        filenamePrefix: "paperclip-test",
+      });
+      const files = fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql.gz"));
+      const ages = files.map((name) => (now - fs.statSync(path.join(backupDir, name)).mtimeMs) / 86400000);
+      expect(files).toHaveLength(7);
+      expect(ages.some((age) => age < 1)).toBe(true);
+      expect(ages.some((age) => age >= 14 && age < 22)).toBe(true);
+      expect(ages.some((age) => age >= 28 && age < 35)).toBe(true);
+    } finally {
+      Date.now = realDateNow;
+    }
+  }, 60_000);
+
   it(
     "keeps the newest backup for each retained calendar month",
     async () => {

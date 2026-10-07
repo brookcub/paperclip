@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -11,6 +11,7 @@ export type BackupRetentionPolicy = {
   dailyDays: number;
   weeklyWeeks: number;
   monthlyMonths: number;
+  maxFiles?: number;
 };
 
 export type RunDatabaseBackupOptions = {
@@ -28,6 +29,7 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  signal?: AbortSignal;
 };
 
 export type RunDatabaseBackupResult = {
@@ -145,10 +147,14 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   const keepWeekBuckets = new Set<string>();
   const keepMonthBuckets = new Set<string>();
   const toDelete: string[] = [];
+  const kept: BackupEntry[] = [];
 
   for (const entry of entries) {
     // Daily tier — keep everything within dailyDays
-    if (entry.mtimeMs >= dailyCutoff) continue;
+    if (entry.mtimeMs >= dailyCutoff) {
+      kept.push(entry);
+      continue;
+    }
 
     const date = new Date(entry.mtimeMs);
     const week = isoWeekKey(date);
@@ -160,6 +166,7 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
         toDelete.push(entry.fullPath);
       } else {
         keepWeekBuckets.add(week);
+        kept.push(entry);
       }
       continue;
     }
@@ -170,12 +177,30 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
         toDelete.push(entry.fullPath);
       } else {
         keepMonthBuckets.add(month);
+        kept.push(entry);
       }
       continue;
     }
 
     // Beyond all retention tiers — delete
     toDelete.push(entry.fullPath);
+  }
+
+  if (retention.maxFiles !== undefined) {
+    if (!Number.isInteger(retention.maxFiles) || retention.maxFiles < 1) {
+      throw new Error("Backup maxFiles must be a positive integer");
+    }
+    // Preserve the newest backup and the oldest retained weekly/monthly tail.
+    // This bounds storage without allowing a busy daily tier to crowd out history.
+    const selected = new Set(kept.slice(0, Math.min(3, retention.maxFiles)).map((entry) => entry.fullPath));
+    const tail = kept.filter((entry) => !selected.has(entry.fullPath));
+    const remaining = retention.maxFiles - selected.size;
+    for (const entry of remaining > 0 ? tail.slice(-remaining) : []) {
+      selected.add(entry.fullPath);
+    }
+    for (const entry of kept) {
+      if (!selected.has(entry.fullPath)) toDelete.push(entry.fullPath);
+    }
   }
 
   for (const filePath of toDelete) {
@@ -321,12 +346,15 @@ async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
+  signal?: AbortSignal;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const { safeConnectionString, password } = cliConnection(opts.connectionString);
+  const partialFile = `${opts.backupFile}.partial`;
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${safeConnectionString}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -335,9 +363,11 @@ async function runPgDumpBackup(opts: {
     ],
     {
       stdio: ["ignore", "pipe", "pipe"],
+      signal: opts.signal,
       env: {
         ...process.env,
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+        ...(password ? { PGPASSWORD: password } : {}),
       },
     },
   );
@@ -346,18 +376,39 @@ async function runPgDumpBackup(opts: {
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
-    waitForChildExit(child, pgDumpBin),
-  ]);
+  try {
+    const results = await Promise.allSettled([
+      pipeline(child.stdout, createGzip(), createWriteStream(partialFile)),
+      waitForChildExit(child, pgDumpBin),
+    ]);
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
+    renameSync(partialFile, opts.backupFile);
+  } finally {
+    if (existsSync(partialFile)) unlinkSync(partialFile);
+  }
+}
+
+function cliConnection(connectionString: string): { safeConnectionString: string; password: string } {
+  const url = new URL(connectionString);
+  if (url.protocol !== "postgres:" && url.protocol !== "postgresql:") {
+    throw new Error("PostgreSQL CLI requires a postgres URI");
+  }
+  if (url.searchParams.has("password")) {
+    throw new Error("PostgreSQL CLI refuses password query parameters");
+  }
+  const password = decodeURIComponent(url.password);
+  url.password = "";
+  return { safeConnectionString: url.toString(), password };
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
+  const { safeConnectionString, password } = cliConnection(opts.connectionString);
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${safeConnectionString}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -367,6 +418,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
       env: {
         ...process.env,
         PGCONNECT_TIMEOUT: String(connectTimeout),
+        ...(password ? { PGPASSWORD: password } : {}),
       },
     },
   );
@@ -554,6 +606,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           connectionString: opts.connectionString,
           backupFile,
           connectTimeout,
+          signal: opts.signal,
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;

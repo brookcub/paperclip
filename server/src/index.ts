@@ -14,7 +14,7 @@ import { reconcileSafeNativeReplacements } from "./services/native-runtime/nativ
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -808,13 +808,30 @@ async function startServerWithDatabaseTeardown(
     resolve(config.databaseBackupDir, "..", "health", "db-backup-to-s3.failure");
   const databaseBackupAlertFiles = [
     databaseBackupAlertFile,
+    resolve(config.databaseBackupDir, "database-backup.failure"),
     resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
     resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
   ];
+  const localBackupFailureFile = resolve(config.databaseBackupDir, "database-backup.failure");
   let databaseBackupInFlight = false;
+  let databaseBackupStopping = false;
+  let databaseBackupAbort: AbortController | null = null;
+  let databaseBackupIdle: Promise<void> = Promise.resolve();
+  let resolveDatabaseBackupIdle: () => void = () => {};
+  const completedBackupToday = () => {
+    if (!existsSync(config.databaseBackupDir)) return false;
+    const now = new Date();
+    const day = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+    return readdirSync(config.databaseBackupDir).some((name) =>
+      name.startsWith(`paperclip-${day}-`) && name.endsWith(".sql.gz"));
+  };
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
   ): Promise<InstanceDatabaseBackupRunResult | null> => {
+    if (databaseBackupStopping) {
+      if (trigger === "scheduled") return null;
+      throw conflict("Database backup unavailable during shutdown");
+    }
     if (databaseBackupInFlight) {
       const message = "Database backup already in progress";
       if (trigger === "scheduled") {
@@ -823,8 +840,19 @@ async function startServerWithDatabaseTeardown(
       }
       throw conflict(message);
     }
+    if (trigger === "scheduled") {
+      try {
+        if (completedBackupToday()) return null;
+      } catch (err) {
+        logger.error({ err, backupDir: config.databaseBackupDir }, "Could not inspect today's database backups");
+        throw err;
+      }
+    }
 
     databaseBackupInFlight = true;
+    const backupAbort = new AbortController();
+    databaseBackupAbort = backupAbort;
+    databaseBackupIdle = new Promise<void>((resolveIdle) => { resolveDatabaseBackupIdle = resolveIdle; });
     const startedAt = new Date();
     const startedAtMs = Date.now();
     const label = trigger === "scheduled" ? "Automatic" : "Manual";
@@ -833,12 +861,23 @@ async function startServerWithDatabaseTeardown(
       // Read retention from Instance Settings (DB) so changes take effect without restart.
       const generalSettings = await backupSettingsSvc.getGeneral();
       const retention = generalSettings.backupRetention;
+      const rawMaxFiles = process.env.PAPERCLIP_DB_BACKUP_MAX_FILES;
+      const maxFiles = rawMaxFiles === undefined ? undefined : Number(rawMaxFiles);
+      if (maxFiles !== undefined && (!Number.isInteger(maxFiles) || maxFiles < 1)) {
+        throw new Error("PAPERCLIP_DB_BACKUP_MAX_FILES must be a positive integer");
+      }
+      const backupEngine = process.env.PAPERCLIP_DB_BACKUP_ENGINE;
+      if (backupEngine !== undefined && backupEngine !== "pg_dump") {
+        throw new Error("PAPERCLIP_DB_BACKUP_ENGINE must be pg_dump when specified");
+      }
 
       const result = await runDatabaseBackup({
         connectionString: activeDatabaseConnectionString,
         backupDir: config.databaseBackupDir,
-        retention,
+        retention: { ...retention, ...(maxFiles === undefined ? {} : { maxFiles }) },
         filenamePrefix: "paperclip",
+        ...(backupEngine === "pg_dump" ? { backupEngine } : {}),
+        signal: backupAbort.signal,
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -850,6 +889,7 @@ async function startServerWithDatabaseTeardown(
         finishedAt: finishedAt.toISOString(),
         durationMs: Date.now() - startedAtMs,
       };
+      rmSync(localBackupFailureFile, { force: true });
       logger.info(
         {
           backupFile: result.backupFile,
@@ -865,9 +905,19 @@ async function startServerWithDatabaseTeardown(
       return response;
     } catch (err) {
       logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
+      if (!backupAbort.signal.aborted) {
+        try {
+          mkdirSync(config.databaseBackupDir, { recursive: true });
+          writeFileSync(localBackupFailureFile, `Local database backup failed at ${new Date().toISOString()}\n`);
+        } catch (markerError) {
+          logger.error({ err: markerError }, "Could not record database backup failure marker");
+        }
+      }
       throw err;
     } finally {
       databaseBackupInFlight = false;
+      databaseBackupAbort = null;
+      resolveDatabaseBackupIdle();
     }
   };
   const pluginWorkerManager = createPluginWorkerManager();
@@ -1823,6 +1873,7 @@ async function startServerWithDatabaseTeardown(
     });
   }
   
+  let databaseBackupTimer: NodeJS.Timeout | null = null;
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
@@ -1834,11 +1885,13 @@ async function startServerWithDatabaseTeardown(
       },
       "Automatic database backups enabled",
     );
-    setInterval(() => {
+    const scheduleBackup = () => {
       void runServerDatabaseBackup("scheduled").catch(() => {
         // runServerDatabaseBackup already logs the failure with context.
       });
-    }, backupIntervalMs);
+    };
+    databaseBackupTimer = setInterval(scheduleBackup, backupIntervalMs);
+    scheduleBackup();
   }
   
   // Wait for external adapters to finish loading before accepting requests.
@@ -1915,6 +1968,9 @@ async function startServerWithDatabaseTeardown(
     exitProcess: boolean,
   ) => {
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+    databaseBackupStopping = true;
+    if (databaseBackupTimer) clearInterval(databaseBackupTimer);
+    databaseBackupAbort?.abort();
     heartbeatSchedulerStopped = true;
     clearInterval(executionControlInterval);
     if (heartbeatSchedulerInterval) {
@@ -1979,6 +2035,7 @@ async function startServerWithDatabaseTeardown(
     const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
       ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
       : null;
+    await databaseBackupIdle;
 
     // Await the ordered application teardown before the process exits. A live
     // setup-token login session must stop and release its sandbox lease before
