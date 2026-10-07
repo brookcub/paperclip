@@ -88,6 +88,8 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         fs.writeFileSync(file, "old backup");
         fs.utimesSync(file, date, date);
       }
+      const interrupted = path.join(backupDir, "paperclip-test-interrupted.sql.partial");
+      fs.writeFileSync(interrupted, "incomplete");
       await runDatabaseBackup({
         connectionString,
         backupDir,
@@ -97,6 +99,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       const files = fs.readdirSync(backupDir).filter((name) => name.endsWith(".sql.gz"));
       const ages = files.map((name) => (now - fs.statSync(path.join(backupDir, name)).mtimeMs) / 86400000);
       expect(files).toHaveLength(7);
+      expect(fs.existsSync(interrupted)).toBe(true);
       expect(ages.some((age) => age < 1)).toBe(true);
       expect(ages.some((age) => age >= 14 && age < 22)).toBe(true);
       expect(ages.some((age) => age >= 28 && age < 35)).toBe(true);
