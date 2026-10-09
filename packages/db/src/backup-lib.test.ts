@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore, verifyCompressedBackup } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -72,6 +72,15 @@ describe("createBufferedTextFileWriter", () => {
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
   });
+});
+
+it("verifies a compressed backup by reading its complete gzip stream", async () => {
+  const archive = path.join(createTempDir("paperclip-gzip-readback-"), "backup.sql.gz");
+  const complete = gzipSync("SELECT 1;");
+  fs.writeFileSync(archive, complete);
+  await expect(verifyCompressedBackup(archive)).resolves.toBeUndefined();
+  fs.writeFileSync(archive, complete.subarray(0, -4));
+  await expect(verifyCompressedBackup(archive)).rejects.toThrow();
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
@@ -144,7 +153,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         Date.now = realDateNow;
       }
     },
-    30_000,
+    90_000,
   );
 
   it(
@@ -278,7 +287,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         await restoreSql.end();
       }
     },
-    60_000,
+    120_000,
   );
 
   it(
@@ -633,6 +642,6 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         await restoreSql.end();
       }
     },
-    20_000,
+    90_000,
   );
 });

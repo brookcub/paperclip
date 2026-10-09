@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
+import { Writable } from "node:stream";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
 
@@ -578,6 +579,12 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   };
 }
 
+export async function verifyCompressedBackup(path: string): Promise<void> {
+  await pipeline(createReadStream(path), createGunzip(), new Writable({
+    write(_chunk, _encoding, done) { done(); },
+  }));
+}
+
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
   const retention = opts.retention;
@@ -611,6 +618,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           connectTimeout,
           signal: opts.signal,
         });
+        await verifyCompressedBackup(backupFile);
         const sizeBytes = statSync(backupFile).size;
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
@@ -1083,6 +1091,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
     unlinkSync(sqlFile);
 
+    await verifyCompressedBackup(backupFile);
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
 
